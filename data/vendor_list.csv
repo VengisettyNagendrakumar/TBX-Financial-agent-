@@ -1,0 +1,13 @@
+vendor_id,vendor_name,category
+V001,"Amazon Web Services, Inc.",Cloud Infrastructure
+V002,Amazon Logistics LLC,Shipping & Fulfillment
+V003,Acme Corporation,Enterprise Software
+V004,CloudScale Technologies,DevOps & Monitoring
+V005,Cloudflare Inc.,Security & CDN
+V006,Stripe Payments,Payment Processing
+V007,Salesforce.com Inc.,Sales & CRM
+V008,Deloitte Advisory,Audit & Legal
+V009,WeWork Global,Office & Facilities
+V010,Google Cloud Platform,Cloud Infrastructure
+V011,Datadog Inc.,Observability
+V012,Slack Technologies,Productivity

@@ -1,0 +1,9 @@
+account_id,account_name,account_type
+ACC-6001,Software & SaaS Subscriptions,Expense
+ACC-6002,Hosting & Infrastructure,Expense
+ACC-6003,Legal & Professional Fees,Expense
+ACC-6004,Office Rent & Facilities,Expense
+ACC-6005,Shipping & Logistics,Expense
+ACC-6006,Payment Gateway Fees,Expense
+ACC-2001,Accounts Payable,Liability
+ACC-1001,Operating Cash Account,Asset

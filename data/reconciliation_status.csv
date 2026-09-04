@@ -1,0 +1,132 @@
+transaction_id,reconciliation_status,reconciled_date,notes
+TXN-50001,Reconciled,2024-02-05,Matched with bank feed
+TXN-50002,Reconciled,2024-03-27,Matched with bank feed
+TXN-50003,Reconciled,2024-04-25,Matched with bank feed
+TXN-50004,Unreconciled,,Unmatched in ledger
+TXN-50005,Pending,,Awaiting bank confirmation
+TXN-50006,Unreconciled,,Unmatched in ledger
+TXN-50007,Reconciled,2024-03-16,Matched with bank feed
+TXN-50008,Reconciled,2024-03-08,Matched with bank feed
+TXN-50009,Reconciled,2024-04-14,Matched with bank feed
+TXN-50010,Pending,,Awaiting bank confirmation
+TXN-50011,Reconciled,2024-05-17,Matched with bank feed
+TXN-50012,Reconciled,2024-02-23,Matched with bank feed
+TXN-50013,Reconciled,2024-02-07,Matched with bank feed
+TXN-50014,Reconciled,2024-03-31,Matched with bank feed
+TXN-50015,Reconciled,2024-04-18,Matched with bank feed
+TXN-50016,Reconciled,2024-05-15,Matched with bank feed
+TXN-50017,Reconciled,2024-05-13,Matched with bank feed
+TXN-50018,Reconciled,2024-02-20,Matched with bank feed
+TXN-50019,Reconciled,2024-03-18,Matched with bank feed
+TXN-50020,Reconciled,2024-04-28,Matched with bank feed
+TXN-50021,Reconciled,2024-05-12,Matched with bank feed
+TXN-50022,Reconciled,2024-02-12,Matched with bank feed
+TXN-50023,Reconciled,2024-03-13,Matched with bank feed
+TXN-50024,Reconciled,2024-03-18,Matched with bank feed
+TXN-50025,Reconciled,2024-04-12,Matched with bank feed
+TXN-50026,Unreconciled,,Unmatched in ledger
+TXN-50027,Reconciled,2024-05-16,Matched with bank feed
+TXN-50028,Reconciled,2024-02-28,Matched with bank feed
+TXN-50029,Reconciled,2024-03-08,Matched with bank feed
+TXN-50030,Unreconciled,,Unmatched in ledger
+TXN-50031,Reconciled,2024-05-19,Matched with bank feed
+TXN-50032,Reconciled,2024-05-27,Matched with bank feed
+TXN-50033,Reconciled,2024-02-27,Matched with bank feed
+TXN-50034,Reconciled,2024-02-21,Matched with bank feed
+TXN-50035,Reconciled,2024-03-22,Matched with bank feed
+TXN-50036,Reconciled,2024-03-24,Matched with bank feed
+TXN-50037,Reconciled,2024-04-07,Matched with bank feed
+TXN-50038,Pending,,Awaiting bank confirmation
+TXN-50039,Unreconciled,,Unmatched in ledger
+TXN-50040,Pending,,Awaiting bank confirmation
+TXN-50041,Unreconciled,,Unmatched in ledger
+TXN-50042,Reconciled,2024-05-01,Matched with bank feed
+TXN-50043,Reconciled,2024-05-11,Matched with bank feed
+TXN-50044,Reconciled,2024-02-09,Matched with bank feed
+TXN-50045,Reconciled,2024-03-01,Matched with bank feed
+TXN-50046,Reconciled,2024-03-21,Matched with bank feed
+TXN-50047,Reconciled,2024-03-20,Matched with bank feed
+TXN-50048,Reconciled,2024-04-25,Matched with bank feed
+TXN-50049,Unreconciled,,Unmatched in ledger
+TXN-50050,Pending,,Awaiting bank confirmation
+TXN-50051,Reconciled,2024-02-12,Matched with bank feed
+TXN-50052,Unreconciled,,Unmatched in ledger
+TXN-50053,Reconciled,2024-03-30,Matched with bank feed
+TXN-50054,Unreconciled,,Unmatched in ledger
+TXN-50055,Unreconciled,,Unmatched in ledger
+TXN-50056,Reconciled,2024-05-08,Matched with bank feed
+TXN-50057,Reconciled,2024-02-29,Matched with bank feed
+TXN-50058,Reconciled,2024-02-17,Matched with bank feed
+TXN-50059,Unreconciled,,Unmatched in ledger
+TXN-50060,Reconciled,2024-04-06,Matched with bank feed
+TXN-50061,Reconciled,2024-05-09,Matched with bank feed
+TXN-50062,Reconciled,2024-02-19,Matched with bank feed
+TXN-50063,Reconciled,2024-02-16,Matched with bank feed
+TXN-50064,Unreconciled,,Unmatched in ledger
+TXN-50065,Reconciled,2024-03-31,Matched with bank feed
+TXN-50066,Reconciled,2024-04-10,Matched with bank feed
+TXN-50067,Reconciled,2024-04-10,Matched with bank feed
+TXN-50068,Unreconciled,,Unmatched in ledger
+TXN-50069,Unreconciled,,Unmatched in ledger
+TXN-50070,Pending,,Awaiting bank confirmation
+TXN-50071,Disputed,,Discrepancy in invoice total
+TXN-50072,Reconciled,2024-02-23,Matched with bank feed
+TXN-50073,Reconciled,2024-02-05,Matched with bank feed
+TXN-50074,Pending,,Awaiting bank confirmation
+TXN-50075,Reconciled,2024-02-24,Matched with bank feed
+TXN-50076,Unreconciled,,Unmatched in ledger
+TXN-50077,Pending,,Awaiting bank confirmation
+TXN-50078,Reconciled,2024-02-17,Matched with bank feed
+TXN-50079,Unreconciled,,Unmatched in ledger
+TXN-50080,Pending,,Awaiting bank confirmation
+TXN-50081,Reconciled,2024-02-14,Matched with bank feed
+TXN-50082,Reconciled,2024-02-27,Matched with bank feed
+TXN-50083,Reconciled,2024-02-25,Matched with bank feed
+TXN-50084,Unreconciled,,Unmatched in ledger
+TXN-50085,Unreconciled,,Unmatched in ledger
+TXN-50086,Pending,,Awaiting bank confirmation
+TXN-50087,Disputed,,Discrepancy in invoice total
+TXN-50088,Reconciled,2024-03-28,Matched with bank feed
+TXN-50089,Reconciled,2024-03-28,Matched with bank feed
+TXN-50090,Reconciled,2024-03-27,Matched with bank feed
+TXN-50091,Reconciled,2024-03-27,Matched with bank feed
+TXN-50092,Reconciled,2024-03-09,Matched with bank feed
+TXN-50093,Reconciled,2024-03-07,Matched with bank feed
+TXN-50094,Reconciled,2024-03-13,Matched with bank feed
+TXN-50095,Unreconciled,,Unmatched in ledger
+TXN-50096,Reconciled,2024-03-26,Matched with bank feed
+TXN-50097,Reconciled,2024-03-11,Matched with bank feed
+TXN-50098,Reconciled,2024-03-20,Matched with bank feed
+TXN-50099,Reconciled,2024-03-15,Matched with bank feed
+TXN-50100,Reconciled,2024-03-11,Matched with bank feed
+TXN-50101,Unreconciled,,Unmatched in ledger
+TXN-50102,Reconciled,2024-04-03,Matched with bank feed
+TXN-50103,Pending,,Awaiting bank confirmation
+TXN-50104,Reconciled,2024-04-20,Matched with bank feed
+TXN-50105,Reconciled,2024-04-22,Matched with bank feed
+TXN-50106,Reconciled,2024-04-07,Matched with bank feed
+TXN-50107,Reconciled,2024-05-02,Matched with bank feed
+TXN-50108,Reconciled,2024-04-11,Matched with bank feed
+TXN-50109,Unreconciled,,Unmatched in ledger
+TXN-50110,Reconciled,2024-05-05,Matched with bank feed
+TXN-50111,Disputed,,Discrepancy in invoice total
+TXN-50112,Unreconciled,,Unmatched in ledger
+TXN-50113,Unreconciled,,Unmatched in ledger
+TXN-50114,Reconciled,2024-04-05,Matched with bank feed
+TXN-50115,Reconciled,2024-04-13,Matched with bank feed
+TXN-50116,Pending,,Awaiting bank confirmation
+TXN-50117,Reconciled,2024-05-14,Matched with bank feed
+TXN-50118,Reconciled,2024-05-07,Matched with bank feed
+TXN-50119,Reconciled,2024-05-31,Matched with bank feed
+TXN-50120,Reconciled,2024-05-31,Matched with bank feed
+TXN-50121,Pending,,Awaiting bank confirmation
+TXN-50122,Unreconciled,,Unmatched in ledger
+TXN-50123,Reconciled,2024-05-15,Matched with bank feed
+TXN-50124,Unreconciled,,Unmatched in ledger
+TXN-50125,Reconciled,2024-05-18,Matched with bank feed
+TXN-50126,Unreconciled,,Unmatched in ledger
+TXN-50127,Reconciled,2024-05-08,Matched with bank feed
+TXN-50128,Reconciled,2024-05-14,Matched with bank feed
+TXN-50129,Pending,,Awaiting bank confirmation
+TXN-50130,Reconciled,2024-05-15,Matched with bank feed
+TXN-50131,Unreconciled,,Unmatched in ledger
