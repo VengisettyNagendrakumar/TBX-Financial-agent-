@@ -34,16 +34,15 @@ def get_anchor_date(con) -> date: #What date should the application consider as 
     All relative dates ('last month', 'this quarter', 'YTD') are anchored
     to this date rather than datetime.now().
     """
-    try:#Find the latest date from vendor payouts AND transactions, then choose whichever is later.
+    try:
+        # Find the latest date from vendor payouts AND transactions, then choose whichever is later.
         res = con.execute(f"""
             SELECT MAX(p_date) FROM (
-                SELECT MAX({config.SCHEMA_CONFIG['vendor_payouts']['date_col']}) as p_date FROM {config.TABLE_PAYOUTS} 
+                SELECT MAX({config.SCHEMA_CONFIG['vendor_payouts']['date_col']}) as p_date FROM {config.TABLE_PAYOUTS}
+                UNION ALL
                 SELECT MAX({config.SCHEMA_CONFIG['transactions']['date_col']}) as p_date FROM {config.TABLE_TRANSACTIONS}
             )
         """).fetchone()
-         # SELECT MAX({config.SCHEMA_CONFIG['vendor_payouts']['date_col']}) as p_date FROM {config.TABLE_PAYOUTS} #SELECT MAX(payout_date)FROM vendor_payouts
-        # SELECT MAX({config.SCHEMA_CONFIG['transactions']['date_col']}) as p_date FROM {config.TABLE_TRANSACTIONS} SELECT MAX(transaction_date)FROM transactions
-        #suppose we have Vendor payouts maximum = May 31 Transactions maximum    = May 30 UNION ALL puts those two results together: may 31 and may 30 SELECT MAX(p_date) i.e may 31
 
         
         if res and res[0]:

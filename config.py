@@ -90,7 +90,8 @@ VENDOR_ALIASES = {
 
 # -------------------------------------------------------------
 # MODEL CONFIGURATION (Groq Engine)
-# Dedicated Model: openai/gpt-oss-120b
+# Section 7 Constraint: Upper limit 20B parameter model
+# Active Model: openai/gpt-oss-20b (Complies with 20B ceiling)
 # -------------------------------------------------------------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-ACTIVE_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+ACTIVE_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")

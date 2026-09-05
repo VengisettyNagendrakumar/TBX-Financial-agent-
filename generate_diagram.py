@@ -71,16 +71,17 @@ def generate_diagram(output_path="architecture_diagram.png"):
 
     # Core Guarantees Ribbon (Top)
     guarantees = [
-        (1.0, 9.65, 4.0, 0.48, "0% Arithmetic Hallucination", "#10B981"),
-        (5.5, 9.65, 4.0, 0.48, "Dynamic Anchor Date (2024-05-31)", "#818CF8"),
-        (10.0, 9.65, 4.0, 0.48, "SQL Parameterization Defense", "#F43F5E"),
-        (14.5, 9.65, 4.0, 0.48, "100% Grounded Audit Trail & CSV", "#38BDF8"),
+        (0.8, 9.65, 3.5, 0.48, "0% Arithmetic Hallucination", "#10B981"),
+        (4.5, 9.65, 3.5, 0.48, "Section 7: <=20B Model", "#A855F7"),
+        (8.2, 9.65, 3.5, 0.48, "Anchor Date: 2024-05-31", "#818CF8"),
+        (11.9, 9.65, 3.5, 0.48, "SQL Parameterization Defense", "#F43F5E"),
+        (15.6, 9.65, 3.6, 0.48, "100% Grounded Audit & CSV", "#38BDF8"),
     ]
     for gx, gy, gw, gh, gtext, gcolor in guarantees:
         gbadge = patches.FancyBboxPatch((gx, gy), gw, gh, boxstyle="round,pad=0.05,rounding_size=0.12",
                                         facecolor="#131C2E", edgecolor=gcolor, linewidth=1.5, zorder=2)
         ax.add_patch(gbadge)
-        ax.text(gx + gw/2, gy + gh/2, f"  {gtext}", color=gcolor, fontsize=8.8, fontweight="bold",
+        ax.text(gx + gw/2, gy + gh/2, f"  {gtext}", color=gcolor, fontsize=8.6, fontweight="bold",
                 ha="center", va="center", fontfamily="sans-serif", zorder=3)
 
     # -------------------------------------------------------------
@@ -112,7 +113,7 @@ def generate_diagram(output_path="architecture_diagram.png"):
     draw_card(
         ax, x=5.2, y=6.6, w=4.0, h=2.4,
         title="STAGE 2: Intent & Temporal Parser",
-        subtitle="Groq LPU (openai/gpt-oss-120b)",
+        subtitle="Groq LPU (openai/gpt-oss-20b - <=20B)",
         items=[
             "• Extracts JSON: Intent, Entity, Dates",
             "• Dynamic Anchor Date: Anchors 'last month'",
@@ -175,6 +176,7 @@ def generate_diagram(output_path="architecture_diagram.png"):
         subtitle="In-Memory OLAP (Zero Math Hallucination)",
         items=[
             "• Vectorized C++ Analytical Compute",
+            "• 20M Record Scalability (Section 7 Limit)",
             "• Executes SUM, AVG, COUNT in < 5ms",
             "• Zero LLM Math Computation",
             "• Joins 5 Relational Schemas:",

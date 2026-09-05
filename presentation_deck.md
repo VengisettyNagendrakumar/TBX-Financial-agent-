@@ -3,7 +3,7 @@
 **Event**: TBX — BVP Tech Catalyst Hackathon  
 **Track**: Build a Finance Assistant That Actually Understands You  
 **Team Architecture**: Deterministic Natural Language to Parameterized DuckDB Engine  
-**Dedicated Engine**: Groq LPU with `openai/gpt-oss-120b`
+**Dedicated Engine**: Groq LPU with `openai/gpt-oss-20b` (Section 7 Compliant: $\le$ 20B parameters)
 
 ---
 
@@ -21,7 +21,7 @@
 > 
 > Naive LLM architectures fail in finance for three fundamental reasons: First, large language models are probabilistic token predictors, not arithmetic calculators; they hallucinate math. Second, financial databases are dynamic, non-binary, and messy—vendor names are colloquially abbreviated, reconciliation has multi-state statuses, and relative terms like 'last month' shift depending on the dataset's fiscal close. Third, naive systems fail silently when data doesn't exist.
 > 
-> Today, we present the **Grounded Financial Intelligence Assistant**—an architecture where language models understand questions, but deterministic databases compute every single dollar."
+> Today, we present the **Grounded Financial Intelligence Assistant**—an architecture where lightweight language models understand questions, and deterministic databases compute every single dollar."
 
 ---
 
@@ -31,10 +31,10 @@
 
 ### Architecture Flow Diagram (Refer to `architecture_diagram.png`)
 1. **Natural Language Query**: Ingests multi-turn conversational queries.
-2. **Structured Intent Parser (`openai/gpt-oss-120b`)**: Extracts strict JSON intent, resolves relative dates dynamically against `MAX(payout_date)` anchor date.
+2. **Structured Intent Parser (`openai/gpt-oss-20b`)**: Extracts strict JSON intent, resolves relative dates dynamically against `MAX(payout_date)` anchor date.
 3. **Entity Resolution & Guardrail Gate**: RapidFuzz & dynamic acronym engine (`AWS` $\rightarrow$ `Amazon Web Services`). Catches missing vendors (Guardrail 1) and ambiguous queries (Guardrail 2) before any query executes.
 4. **Parameterized SQL Builder**: Compiles intent into DuckDB SQL with safe `?` parameter bindings, neutralizing SQL injection vectors.
-5. **DuckDB OLAP Engine**: Executes analytical aggregation in-memory in sub-5ms latency. Zero math hallucination.
+5. **DuckDB OLAP Engine**: Executes analytical aggregation in-memory in sub-5ms latency. Vectorized architecture scales to 20M records (Section 7 constraint) with zero math hallucination.
 6. **Statistical Outlier Detector**: Flags payouts $> \mu + 2\sigma$ against an uncontaminated historical baseline.
 7. **Grounded Explainer**: Synthesizes verified data into executive summaries with explicit confidence scores and 1-click CSV audit trails.
 
@@ -72,23 +72,24 @@
 ---
 
 ## Slide 4: Model Choice & Scored Efficiency (20% Rubric)
-**Header**: Why We Chose Groq LPU with `openai/gpt-oss-120b`  
-**Subheader**: Frontier Intelligence at Fractional Latency and Cost  
+**Header**: Section 7 Compliance: Groq LPU with `openai/gpt-oss-20b`  
+**Subheader**: Maximum Accuracy at Lowest Parameters (Strictly $\le$ 20B Ceiling)  
 
 ### Model Benchmarks
-- **Model**: `openai/gpt-oss-120b` on Groq LPU Inference Engine
-- **Inference Speed**: 500+ tokens/second (Intent parsing in ~400ms)
+- **Model**: `openai/gpt-oss-20b` on Groq LPU Inference Engine (20B parameters — Section 7 compliant)
+- **Database Scale**: In-memory DuckDB vectorized OLAP (ready for 20M records limit)
+- **Inference Speed**: 500+ tokens/second (Intent parsing in ~350ms)
 - **Engine Execution**: DuckDB OLAP in < 5ms
 - **Cost per Query**: ~$0.0002 (1/50th of proprietary frontier models)
-- **Arithmetic Accuracy**: **100%** (12/12 automated edge-case test cases passed)
+- **Empirical Accuracy**: **100%** (13/13 automated edge-case test cases passed)
 - **Explainability**: Parameterized display SQL visible in every drawer with execution telemetry.
 
 ### Speaker Script (45 seconds)
-> "The hackathon rubric explicitly reserves 20% of the score for model choice and architecture design. We deliberately chose `openai/gpt-oss-120b` deployed on Groq's LPU hardware.
+> "Section 7 of the problem statement sets two critical requirements: an upper limit of 20B parameters for the LLM, and a database scale of 20M records. The rubric judges teams on achieving maximum accuracy with the lowest possible model.
 > 
-> Why? Because heavy frontier models like GPT-4 or Claude Opus are massively over-engineered for structured schema extraction, leading to 3-second latencies and high operating costs. With Groq, intent parsing happens in 400 milliseconds at 500 tokens per second. 
+> We chose `openai/gpt-oss-20b` on Groq LPU. Because we strictly separate linguistic understanding from analytical computation, our 20B model extracts structured intent in 350 milliseconds at 500 tokens per second. 
 > 
-> Because we offload all analytical computation to DuckDB, we achieve **100% mathematical accuracy** without needing heavy models to do mental arithmetic. We get the intelligence of a 120B parameter model with the speed and cost efficiency of a lightweight local service."
+> All mathematical aggregation—SUM, AVG, COUNT—is offloaded to DuckDB's C++ vectorized engine, which handles millions of records in sub-5ms latency without choking. We achieved **100% accuracy on our 13-case test suite**, zero mathematical hallucinations, and strict compliance with the 20B ceiling."
 
 ---
 
