@@ -465,13 +465,6 @@ class FinanceAgent:
                 "direction": direction,
             }
 
-        # Largest / anomaly transaction check (e.g. "What were my largest transactions?", "spend spikes")
-        if re.search(r"\b(largest|highest|biggest|max|spike|anomalous|unusual)\b[\w\s]{0,20}\b(transactions?|payments?|payouts?|charges?|spikes?)\b", low) or \
-           re.search(r"\b(spend spikes?|anomalies|outliers?)\b", low):
-            return "list_transactions", {
-                "merchant": merchant, "period": period, "direction": direction or config.TXN_DEBIT,
-                "limit": 5, "order_by": "amount"}
-
         if re.search(r"\b(most|highest|top|largest|biggest|ranked?|who did i)\b", low):
             kind = None
             if re.search(r"\b(friend|person|people|someone|who)\b", low):

@@ -104,45 +104,17 @@ with st.sidebar:
                f"not today's date.")
 
     st.divider()
-    st.markdown("### 💡 Sample Queries")
-
-    with st.expander("⚖️ **Ambiguity & Clarification Demos**", expanded=True):
-        st.caption("Tests interactive follow-up clarification gates and guardrails:")
-        ambiguity_queries = [
-            ("What is my expenses on amazon?", "Ambiguous timeframe across 24 months of activity — prompts for period"),
-            ("How much did I spend on selection?", "Ambiguous counterparty with 3 candidates: Navyug, Umang, or Electronics"),
-            ("How much did my friend pay me in the last 3 months?", "Ambiguous person — prompts which individual or Everyone"),
-            ("I want to calculate my spending for swiggy", "Unspecified period — triggers interactive period selection"),
-            ("What did I spend on Oracle?", "Absent counterparty — triggers guardrail protection (0.0 / not on record)"),
-        ]
-        for q, tip in ambiguity_queries:
-            if st.button(q, key=f"s_amb_{q}", help=tip, use_container_width=True):
-                st.session_state.queued = q
-
-    with st.expander("⚠️ **Anomaly & Outlier Demos**", expanded=True):
-        st.caption("Detects spend spikes, peak amounts, and statistical outliers:")
-        anomaly_queries = [
-            ("What were my largest transactions?", "Surfaces top transactions ordered by amount to inspect outliers"),
-            ("Show my largest transaction on Swiggy last month", "Pinpoints peak single transaction for a specific vendor"),
-            ("Show all my transactions for Swiggy", "Lists granular transactions and highlights unusual spend patterns"),
-            ("Did I have any spend spikes or unusual transactions?", "Retrieves peak charges across the account"),
-        ]
-        for q, tip in anomaly_queries:
-            if st.button(q, key=f"s_anom_{q}", help=tip, use_container_width=True):
-                st.session_state.queued = q
-
-    with st.expander("📊 **Core Spend & Analytics**", expanded=False):
-        st.caption("Standard financial aggregations, rankings, and balance inquiries:")
-        core_queries = [
-            "How much have I spent on Swiggy last month?",
-            "How much have I spent on Zomato total?",
-            "Which vendor have I spent on the most?",
-            "How does that compare to the month before?",
-            "Show my balance",
-        ]
-        for q in core_queries:
-            if st.button(q, key=f"s_core_{q}", use_container_width=True):
-                st.session_state.queued = q
+    st.caption("**Try asking**")
+    for q in ["How much have I spent on Swiggy last month?",
+              "How much have I spent on Zomato total?",
+              "Which vendor have I spent on the most?",
+              "How much did my friend pay me in the last 3 months?",
+              "I want to calculate my spending for swiggy",
+              "How does that compare to the month before?",
+              "What did I spend on Oracle?",
+              "Show my balance"]:
+        if st.button(q, key=f"s_{q}", use_container_width=True):
+            st.session_state.queued = q
 
     st.divider()
     llm_on = bool(os.getenv("GROQ_API_KEY", config.GROQ_API_KEY))
