@@ -89,6 +89,12 @@ with st.sidebar:
         st.markdown("**Benchmark Accuracy**:")
         st.caption("100% (13/13 automated edge-case test cases passed, 0% math error).")
 
+    with st.expander("🔌 Backend REST API (FastAPI)"):
+        st.markdown("**Server File**: `api.py` (FastAPI)")
+        st.markdown("**Interactive Swagger UI**: `http://localhost:8000/docs`")
+        st.markdown("**Production Endpoints**:")
+        st.caption("• `POST /api/query`: Natural language query pipeline\n• `GET /api/health`: Database health & anchor date\n• `GET /api/vendors`: Canonical vendor records\n• `GET /api/reconciliation/stats`: Multi-state breakdown")
+
     st.markdown("---")
     if st.button("🗑️ Clear Conversation", use_container_width=True):
         st.session_state.messages = []

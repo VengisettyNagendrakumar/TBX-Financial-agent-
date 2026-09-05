@@ -108,6 +108,13 @@ python test_suite.py
 streamlit run app.py
 ```
 
+### 6. Launch Standalone Backend REST API (FastAPI)
+```bash
+python api.py
+# Or: uvicorn api:app --reload --port 8000
+# Interactive Swagger UI: http://localhost:8000/docs
+```
+
 ---
 
 ## 🔄 Swapping Real Hackathon Data (5 Minutes)
@@ -140,6 +147,7 @@ When the hackathon organizers provide the official starter dataset:
 ## 📁 Key Submission Deliverables
 
 - `app.py`: Streamlit conversational interface with verifiable dataframes, CSV downloads, and execution audit trace.
+- `api.py`: FastAPI production REST API backend with Swagger documentation at `http://localhost:8000/docs`.
 - `architecture_diagram.png`: 300-DPI visual architecture schematic illustrating the 5-stage pipeline and Section 7 guarantees.
 - `presentation_deck.pptx`: Publication-grade 6-slide widescreen PowerPoint deck with dark-theme styling and visual cards.
 - `presentation_deck.md`: Slide-by-slide presentation script with speaker notes and rubric mappings.
