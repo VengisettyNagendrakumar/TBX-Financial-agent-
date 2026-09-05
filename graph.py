@@ -361,7 +361,8 @@ def build_graph(agent):
         elif tool == "list_transactions":
             r = queries.list_transactions(agent.con, agent.entity_id, direction, tr,
                                           merchant=canonical, kind=kind,
-                                          limit=int(args.get("limit") or 50))
+                                          limit=int(args.get("limit") or 50),
+                                          order_by=args.get("order_by", "date"))
             k = "list"
         else:
             r = queries.query_spend(agent.con, agent.entity_id, direction, tr,

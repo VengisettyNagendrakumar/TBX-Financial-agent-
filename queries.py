@@ -353,7 +353,7 @@ MAX_LIST_ROWS = 200
 
 def list_transactions(con, entity_id: str, direction: str = None, time_range=None,
                       merchant: str = None, kind: str = None,
-                      limit: int = 50) -> QueryResult:
+                      limit: int = 50, order_by: str = "date") -> QueryResult:
     """Individual rows. Always reads the fact table; descriptions are redacted."""
     t0 = time.perf_counter()
     _require_entity(entity_id)
@@ -386,13 +386,14 @@ def list_transactions(con, entity_id: str, direction: str = None, time_range=Non
     row = f.iloc[0] if not f.empty else {}
     total_rows = int(_num(row.get("n")))
 
+    sort_clause = f"{txn['amount_col']} DESC" if order_by == "amount" else f"{txn['date_col']} DESC"
     rows_sql = f"""
         SELECT {txn['date_col']} AS transaction_date, merchant_norm,
                counterparty_kind, {txn['type_col']} AS transaction_type,
                {txn['amount_col']} AS amount, channel,
                {txn['ref_col']} AS reference_id, {txn['desc_col']} AS description
         FROM {config.TABLE_TXN_FACT} WHERE {clause}
-        ORDER BY {txn['date_col']} DESC LIMIT {limit}
+        ORDER BY {sort_clause} LIMIT {limit}
     """
     rows = db.query_df(con, rows_sql, params)
     if not rows.empty and "description" in rows.columns:
@@ -407,6 +408,8 @@ def list_transactions(con, entity_id: str, direction: str = None, time_range=Non
         "merchant": merchant,
     }
     notes = []
+    if order_by == "amount" and not rows.empty:
+        notes.append("Sorted by transaction amount (highest first) to highlight peak spend and potential outliers.")
     if total_rows > len(rows):
         notes.append(f"Showing {len(rows)} of {total_rows} transactions. "
                      f"The total above covers all {total_rows}.")
