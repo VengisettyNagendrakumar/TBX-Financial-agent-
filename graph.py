@@ -83,7 +83,7 @@ class TurnState(TypedDict, total=False):
     trace: Annotated[list, operator.add]
 
 
-def build_graph(agent):
+def build_graph(agent, checkpointer=None):
     """
     Compiles the turn graph, closing over a FinanceAgent for domain logic.
 
@@ -446,7 +446,7 @@ def build_graph(agent):
     g.add_edge("execute", "narrate")
     g.add_edge("narrate", END)
 
-    return g.compile()
+    return g.compile(checkpointer=checkpointer)
 
 
 def ascii_diagram(compiled) -> str:

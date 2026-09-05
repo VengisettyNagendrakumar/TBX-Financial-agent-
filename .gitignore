@@ -10,3 +10,7 @@ myenv/
 *.duckdb.wal
 data/*.parquet
 data/*.csv
+/.claude
+
+# local conversation history
+chats.db

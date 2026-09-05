@@ -27,6 +27,8 @@ import db
 import agent as agent_mod
 import explainer
 import session as session_mod
+import chatstore
+import pandas as pd
 
 st.set_page_config(page_title="Finance Assistant", page_icon="💸",
                    layout="wide", initial_sidebar_state="expanded")
@@ -122,24 +124,83 @@ with st.sidebar:
     llm_on = bool(os.getenv("GROQ_API_KEY", config.GROQ_API_KEY))
     st.caption(f"Planner: **{'LLM + rules fallback' if llm_on else 'rules only (no API key)'}**")
     st.caption(f"Model: `{config.ACTIVE_MODEL}`")
-    if st.button("🗑 Clear conversation", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.pending = None
-        st.rerun()
 
 # ---------------------------------------------------------------- state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "pending" not in st.session_state:
-    st.session_state.pending = None
+@st.cache_resource(show_spinner=False)
+def get_store():
+    return chatstore.get_store()
 
 
 @st.cache_resource(show_spinner=False)
-def get_agent(_con, _sess, entity):
-    return agent_mod.FinanceAgent(_con, session=_sess)
+def get_agent(_con, _sess, _store, entity):
+    # The checkpointer writes each turn's graph state under the conversation,
+    # so a clarification survives a restart rather than only a rerun.
+    return agent_mod.FinanceAgent(_con, session=_sess,
+                                  checkpointer=_store.checkpointer())
 
 
-bot = get_agent(con, sess, entity_id)
+store = get_store()
+bot = get_agent(con, sess, store, entity_id)
+
+# One conversation is "current". Its transcript lives on disk, so a refresh
+# reloads it rather than starting over.
+if "thread_id" not in st.session_state:
+    existing = store.list_threads(entity_id, limit=1)
+    st.session_state.thread_id = (existing[0]["thread_id"] if existing
+                                  else store.new_thread(entity_id))
+thread_id = st.session_state.thread_id
+
+
+def load_messages(tid):
+    """Rehydrates a stored transcript into what render() expects."""
+    out = []
+    for m in store.get_messages(tid):
+        rows = m.pop("rows", None)
+        m["rows"] = pd.DataFrame(rows) if rows else None
+        out.append(m)
+    return out
+
+
+if st.session_state.get("_loaded_thread") != thread_id:
+    st.session_state.messages = load_messages(thread_id)
+    st.session_state.pending = store.get_pending(thread_id) or None
+    st.session_state._loaded_thread = thread_id
+
+# ------------------------------------------------------- chat list (sidebar)
+with st.sidebar:
+    st.divider()
+    c1, c2 = st.columns([3, 2])
+    c1.caption("**Conversations**")
+    if c2.button("＋ New", use_container_width=True):
+        st.session_state.thread_id = store.new_thread(entity_id)
+        st.session_state.pop("_loaded_thread", None)
+        st.rerun()
+
+    threads = store.list_threads(entity_id, limit=30)
+    for t in threads:
+        tid, current = t["thread_id"], t["thread_id"] == thread_id
+        row = st.columns([6, 1])
+        label = ("● " if current else "") + (t["title"] or "New chat")
+        if row[0].button(label, key=f"th_{tid}", use_container_width=True,
+                         help=f"{t['message_count']} messages",
+                         type="primary" if current else "secondary"):
+            st.session_state.thread_id = tid
+            st.session_state.pop("_loaded_thread", None)
+            st.rerun()
+        if row[1].button("🗑", key=f"del_{tid}", help="Delete this conversation"):
+            store.delete_thread(tid)
+            if current:
+                remaining = [x for x in threads if x["thread_id"] != tid]
+                st.session_state.thread_id = (remaining[0]["thread_id"] if remaining
+                                              else store.new_thread(entity_id))
+            st.session_state.pop("_loaded_thread", None)
+            st.rerun()
+
+    st.divider()
+    stats = store.stats()
+    st.caption(f"{stats['threads']} conversation(s), {stats['messages']} messages "
+               f"on disk ({stats['bytes'] / 1024:.0f} KB)")
+    st.caption(f"`{os.path.basename(stats['path'])}`")
 
 st.title("Conversational Finance Assistant")
 st.caption("Every number is computed by the database. The model explains results — "
@@ -260,17 +321,27 @@ if st.session_state.get("chosen"):
     prompt = st.session_state.pop("chosen")
 
 if prompt:
+    # Name a new conversation after its first message.
+    if not st.session_state.messages:
+        store.rename_thread(thread_id, prompt)
+
     st.session_state.messages.append({"role": "user", "content": prompt})
+    store.append_message(thread_id, "user", prompt)
     with st.chat_message("user"):
         st.markdown(esc(prompt), unsafe_allow_html=True)
 
+    # The current question is already appended, so it is excluded from the
+    # history handed to the planner -- passing it twice wastes one of the four
+    # history slots and can distort follow-up detection.
     history = [{"role": m["role"], "content": m.get("content", ""),
                 "context": m.get("context", {})}
-               for m in st.session_state.messages]
+               for m in st.session_state.messages[:-1]]
+    turn_no = len(st.session_state.messages)
 
     with st.chat_message("assistant"):
         with st.spinner("Querying…"):
-            res = bot.run(prompt, history=history, pending=st.session_state.pending)
+            res = bot.run(prompt, history=history, pending=st.session_state.pending,
+                          thread_id=thread_id, turn=turn_no)
 
         msg = {"role": "assistant", "trace": res.trace,
                "meta": {"latency_ms": res.latency_ms, "planner": res.planner,
@@ -308,6 +379,14 @@ if prompt:
                     msg["interpretation"] = "Interpreted as " + ", ".join(bits) + "."
 
         st.session_state.messages.append(msg)
+
+        # Persist the turn. `rows` is stored as capped JSON records so the
+        # table redraws after a restart without re-running the query.
+        payload = {k: v for k, v in msg.items() if k not in ("role", "content", "rows")}
+        payload["rows"] = chatstore.frame_to_records(msg.get("rows"))
+        store.append_message(thread_id, "assistant", msg["content"], payload)
+        store.set_pending(thread_id, st.session_state.pending)
+
         render(msg, key=len(st.session_state.messages))
 
 # Clarification options render as buttons on the latest assistant turn.

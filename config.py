@@ -26,6 +26,11 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 # Persisted analytical warehouse. Built once, reloaded instantly on restart.
 WAREHOUSE_PATH = os.path.join(BASE_DIR, "warehouse.duckdb")
 
+# Conversations + LangGraph thread checkpoints. Deliberately NOT inside the
+# warehouse: `ingest.py --purge` wipes the dummy financial data, and chat
+# history should survive that.
+CHAT_DB_PATH = os.getenv("TBX_CHAT_DB", os.path.join(BASE_DIR, "chats.db"))
+
 # -------------------------------------------------------------
 # SOURCE TABLES  (edit column names here when the real export lands)
 # -------------------------------------------------------------

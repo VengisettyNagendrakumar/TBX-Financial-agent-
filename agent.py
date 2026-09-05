@@ -27,6 +27,7 @@ import os
 import re
 import json
 import time
+import uuid
 from dataclasses import dataclass, field
 
 import config
@@ -391,7 +392,7 @@ def extract_merchant(text: str, vocabulary: list):
 # =============================================================
 
 class FinanceAgent:
-    def __init__(self, con, entity_id=None, session=None):
+    def __init__(self, con, entity_id=None, session=None, checkpointer=None):
         # Accepts a Session (preferred) or a bare entity_id for tests.
         if session is None:
             import session as session_mod
@@ -406,7 +407,7 @@ class FinanceAgent:
 
         # Compiled once; the topology is static, only the state varies.
         from graph import build_graph
-        self._graph = build_graph(self)
+        self._graph = build_graph(self, checkpointer=checkpointer)
 
     # ---------- planning ----------
 
@@ -737,18 +738,38 @@ class FinanceAgent:
 
     # ---------- execution ----------
 
-    def run(self, message: str, history: list = None, pending: dict = None) -> AgentResult:
+    def run(self, message: str, history: list = None, pending: dict = None,
+            thread_id: str = None, turn: int = None) -> AgentResult:
         """
         Runs one turn through the LangGraph state machine.
 
         The public contract is unchanged from the hand-rolled version: same
-        arguments, same AgentResult. Only orchestration moved.
+        arguments, same AgentResult. `thread_id` and `turn` are optional and
+        only affect where checkpoints are written.
         """
         t0 = time.perf_counter()
         state = {"message": message, "history": history or [],
                  "pending_in": pending or {}, "trace": []}
+
+        # `thread_id` here is the CONVERSATION id. The graph gets a derived
+        # per-turn thread instead, because a LangGraph thread is one continuing
+        # execution while a chat is many executions that share context.
+        #
+        # Reusing the conversation id as the graph thread makes turn 2 resume
+        # turn 1's finished state: every node sees `status` already set, routes
+        # straight to END, and the previous answer comes back verbatim.
+        # `checkpoint_ns` does not help -- it is reserved for subgraphs and is
+        # normalised to '' at the top level. Deriving `conv#turn` keeps a
+        # conversation's checkpoints greppable together (and deletable with a
+        # LIKE) while giving every turn a clean slate.
+        #
+        # A checkpointer also makes the config mandatory, so callers without a
+        # conversation (tests, scripts) get an ephemeral id rather than an error.
+        graph_thread = (f"{thread_id}#{turn if turn is not None else uuid.uuid4().hex[:8]}"
+                        if thread_id else f"ephemeral#{uuid.uuid4().hex}")
+        cfg = {"configurable": {"thread_id": graph_thread}}
         try:
-            final = self._graph.invoke(state)
+            final = self._graph.invoke(state, config=cfg)
         except UnresolvedFilterError as e:
             final = {
                 "status": CLARIFY,

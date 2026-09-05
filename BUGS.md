@@ -845,7 +845,7 @@ One function, one place, and it closes B01/B09/B11 together.
 
 ### What's wrong
 
-The headline claim in `README.md` and `MODEL_CHOICE.md` is **"13/13 passed, 0%
+The V1 headline claim in `README.md` and the since-removed `MODEL_CHOICE.md` was **"13/13 passed, 0%
 math error."** But the checks are structural. Test 1:
 
 ```python
@@ -1241,7 +1241,7 @@ Route `pipeline.py` and `anomaly.py` through it.
 <a id="b16"></a>
 ## B16 — Ships the largest permitted model with no smaller-model benchmark
 
-**Severity:** 🟡 Medium (but worth **20%** of the score) &nbsp;|&nbsp; **Files:** [config.py](config.py), [MODEL_CHOICE.md](MODEL_CHOICE.md)
+**Severity:** 🟡 Medium (but worth **20%** of the score) &nbsp;|&nbsp; **Files:** [config.py](config.py), [README.md](README.md) §3
 
 ### What's wrong
 
@@ -1259,7 +1259,7 @@ Two specific risks:
 
 1. `gpt-oss-20b` is ~21B *total* parameters (≈3.6B active, mixture-of-experts).
    A judge reading the parameter count literally could score it as exceeding the
-   20B cap. `MODEL_CHOICE.md` asserts "**20B parameters** (strictly satisfies the
+   20B cap. The V1 note asserted "**20B parameters** (strictly satisfies the
    ≤ 20B ceiling)" without addressing this.
 2. The LLM only does JSON intent extraction and result summarisation. Neither
    task plausibly needs 20B.
@@ -1268,7 +1268,7 @@ Two specific risks:
 
 ```bash
 grep -n "ACTIVE_MODEL" config.py
-grep -rn "8b\|9b\|smaller model\|benchmark.*model" MODEL_CHOICE.md
+grep -rn "8b\|9b\|smaller model\|benchmark.*model" README.md
 ```
 
 The first returns the 20B default; the second returns no comparison against any
@@ -1288,7 +1288,7 @@ for m in MODELS:
 ```
 
 Ship the **smallest** model that scores 100%, and paste the table into
-`MODEL_CHOICE.md` and the deck.
+README.md §3 and the deck.
 
 ### Fix
 
@@ -1454,7 +1454,7 @@ assumed.
 <a id="b20"></a>
 ## B20 — 20M-record and `<5ms` claims are unmeasured
 
-**Severity:** 🟢 Low &nbsp;|&nbsp; **Files:** [README.md](README.md), [MODEL_CHOICE.md](MODEL_CHOICE.md)
+**Severity:** 🟢 Low &nbsp;|&nbsp; **Files:** [README.md](README.md), [README.md](README.md) §3
 
 ### What's wrong
 
@@ -1471,7 +1471,7 @@ The claims are plausible. They are just not evidenced, and a judge who asks
 
 ```bash
 wc -l data/*.csv
-grep -rn "20M\|sub-5ms\|500+ tok" README.md MODEL_CHOICE.md | head
+grep -rn "20M\|sub-5ms\|500+ tok" README.md | head
 ls benchmark* scale* 2>/dev/null || echo "no benchmark script in repo"
 ```
 

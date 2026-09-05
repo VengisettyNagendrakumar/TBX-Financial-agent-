@@ -95,6 +95,38 @@ def purge(assume_yes: bool = False, keep_files: bool = False) -> bool:
     return True
 
 
+def purge_chats(assume_yes: bool = False) -> bool:
+    """
+    Deletes saved conversations.
+
+    Separate from --purge because chat history is not financial data: reloading
+    the dataset should not silently destroy the conversations, but before a
+    judged demo you may well want a clean slate.
+    """
+    path = config.CHAT_DB_PATH
+    if not os.path.exists(path):
+        print("No saved conversations to delete.")
+        return True
+    size = os.path.getsize(path)
+    print(f"\nConversations: {os.path.relpath(path, config.BASE_DIR)} "
+          f"({size / 1e6:.1f} MB)")
+    if not assume_yes:
+        try:
+            reply = input("Delete all saved conversations? [y/N] ").strip().lower()
+            if reply not in ("y", "yes"):
+                print("Kept.")
+                return False
+        except EOFError:
+            return False
+    try:
+        os.remove(path)
+        print("Conversations deleted.")
+    except OSError as e:
+        print(f"Could not delete: {e}")
+        return False
+    return True
+
+
 # ---------------------------------------------------------------- connect
 
 def connect_and_validate(url: str, allow_insecure: bool):
@@ -213,6 +245,9 @@ def main():
                     help="Delete the dummy data and stop.")
     ap.add_argument("--keep-files", action="store_true",
                     help="With --purge, delete the warehouse but keep data/ files.")
+    ap.add_argument("--purge-chats", action="store_true",
+                    help="Also delete saved conversations (chats.db). Chat history "
+                         "is kept by default so a data reload does not wipe it.")
     ap.add_argument("--yes", "-y", action="store_true",
                     help="Skip the delete confirmation.")
     ap.add_argument("--limit", type=int,
@@ -228,6 +263,8 @@ def main():
         if args.purge_only:
             _rule("PURGE")
             purge(assume_yes=args.yes, keep_files=args.keep_files)
+            if args.purge_chats:
+                purge_chats(assume_yes=args.yes)
             return 0
 
         url = datasource.resolve_url(args.url)
@@ -249,6 +286,8 @@ def main():
             _rule("PURGE")
             if not purge(assume_yes=args.yes, keep_files=args.keep_files):
                 return 1
+            if args.purge_chats:
+                purge_chats(assume_yes=args.yes)
         elif not args.incremental and os.path.exists(config.WAREHOUSE_PATH):
             print("\nNOTE: an existing warehouse will be replaced. Use --purge to "
                   "also remove the dummy data files in data/.")

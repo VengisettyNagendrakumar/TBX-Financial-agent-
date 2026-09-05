@@ -11,6 +11,11 @@ pyarrow>=15.0.0
 # runtime, model wrapper or chain abstraction is used -- see ARCHITECTURE_V2.md §14.
 langgraph>=0.2.0
 
+# SqliteSaver ships as its own distribution, NOT inside langgraph. Without it
+# `from langgraph.checkpoint.sqlite import SqliteSaver` fails on a fresh clone
+# and conversation persistence breaks at startup.
+langgraph-checkpoint-sqlite>=2.0.0
+
 # Optional: renders the compiled graph as ASCII for docs/debugging
 # (graph.ascii_diagram). Everything works without it.
 grandalf>=0.8

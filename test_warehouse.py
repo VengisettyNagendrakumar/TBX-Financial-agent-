@@ -802,6 +802,77 @@ def test_agent(con):
     check("compare_spend still requires period_b",
           "period_b" in cmp_tool["parameters"]["required"])
 
+    # ---- chat threads on disk ----------------------------------------
+    import tempfile, chatstore as CS
+    tmp = os.path.join(tempfile.mkdtemp(), "chats_test.db")
+    cstore = CS.ChatStore(tmp)
+
+    t1 = cstore.new_thread(ent, "first")
+    t2 = cstore.new_thread(ent, "second")
+    check("threads get distinct ids", t1 != t2)
+
+    cstore.append_message(t1, "user", "How much on Swiggy last month?")
+    cstore.append_message(t1, "assistant", "You spent 1.00",
+                          {"context": {"merchant": "SWIGGY",
+                                       "period_token": "last_month"},
+                           "rows": [{"merchant_norm": "SWIGGY", "total_amount": 1.0}]})
+    cstore.append_message(t2, "user", "Zomato total?")
+    check("conversations do not leak into each other",
+          len(cstore.get_messages(t1)) == 2 and len(cstore.get_messages(t2)) == 1)
+
+    # Survives a restart: a NEW store object over the same file.
+    reopened = CS.ChatStore(tmp)
+    msgs = reopened.get_messages(t1)
+    check("transcript survives a reopen", len(msgs) == 2, f"{len(msgs)}")
+    check("the stored table snapshot is restored",
+          msgs[1].get("rows") and msgs[1]["rows"][0]["merchant_norm"] == "SWIGGY",
+          f"{msgs[1].get('rows')}")
+    check("follow-up context survives a reopen",
+          reopened.history_for_agent(t1)[-1]["context"]["merchant"] == "SWIGGY")
+
+    # An open clarifying question must survive a refresh, or the user's reply
+    # is read as a brand-new question.
+    cstore.set_pending(t1, {"slot": "period", "tool": "get_spend",
+                            "merchant": "SWIGGY"})
+    check("pending clarification persists",
+          CS.ChatStore(tmp).get_pending(t1).get("merchant") == "SWIGGY")
+    cstore.set_pending(t1, None)
+    check("pending clears", CS.ChatStore(tmp).get_pending(t1) == {})
+
+    check("threads are listed newest first",
+          [t["thread_id"] for t in cstore.list_threads(ent)][0] == t1,
+          "t1 was touched most recently")
+    check("message counts are reported",
+          {t["thread_id"]: t["message_count"] for t in cstore.list_threads(ent)}[t1] == 2)
+
+    # Each turn needs its own graph thread; reusing the conversation id makes
+    # turn 2 resume turn 1's finished state and repeat its answer.
+    bot2 = A.FinanceAgent(con, entity_id=ent, checkpointer=cstore.checkpointer())
+    tconv = cstore.new_thread(ent, "isolation")
+    a1 = bot2.run("How much have I spent on Swiggy last month?",
+                  thread_id=tconv, turn=0)
+    a2 = bot2.run("Show my balance", thread_id=tconv, turn=1)
+    check("consecutive turns in one conversation are independent",
+          a1.answer != a2.answer and a2.kind == "balances",
+          f"{a2.kind}: {a2.answer[:60]}")
+    check("a turn still runs with no thread_id",
+          bot2.run("Show my balance").status == A.ANSWER)
+
+    ncp = cstore.con.execute(
+        "SELECT COUNT(*) FROM checkpoints WHERE thread_id LIKE ?",
+        (f"{tconv}#%",)).fetchone()[0]
+    check("checkpoints are written under the conversation", ncp > 0, f"{ncp}")
+    cstore.delete_thread(tconv)
+    ncp_after = cstore.con.execute(
+        "SELECT COUNT(*) FROM checkpoints WHERE thread_id LIKE ?",
+        (f"{tconv}#%",)).fetchone()[0]
+    check("deleting a conversation removes its checkpoints too",
+          ncp_after == 0, f"{ncp_after}")
+    check("deleting a conversation removes its messages",
+          cstore.get_messages(tconv) == [])
+
+    cstore.close(); reopened.close()
+
     # Grounding verification: an invented figure must be rejected.
     r6 = bot.run("How much have I spent on Swiggy last month?")
     if r6.result is not None:
