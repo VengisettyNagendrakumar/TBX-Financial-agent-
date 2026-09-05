@@ -1,279 +1,326 @@
 """
-Grounded Financial Assistant - Streamlit Application
-===================================================
-TBX — BVP Tech Catalyst Hackathon
-Problem Statement: Build a Finance Assistant That Actually Understands You
+Finance Assistant — Chat UI (Phase 4)
+=====================================
+    streamlit run app.py
 
-Features:
-- Deterministic SQL Execution via DuckDB (Zero math hallucination)
-- Lightweight Model Architecture (Scored Requirement - 20%)
-- Guardrails for Ambiguous and Non-existent Data (Must Have)
-- Verifiable Tables + 1-Click CSV Export (Good to Have)
-- Statistical Anomaly Callouts (Bonus)
-- Multi-Turn Conversation Memory
-- Full Explainability & Audit Trail (Must Have)
+Streamlit is the Phase 4 surface. Phase 5 moves transport to FastAPI behind
+TLS, since Streamlit cannot terminate HTTPS itself; the agent underneath is
+unchanged by that move.
+
+What the UI is responsible for:
+  - selecting the entity (the session's identity; the model never sees it)
+  - rendering clarifying questions as clickable options and resuming the turn
+  - showing the resolved interpretation, so a wrong window is visible rather
+    than silent (the lesson of BUGS.md B01)
+  - the audit trace: every tool call, the SQL, timings, and whether the
+    narration was model-written or a verified fallback
 """
 
-import re
 import os
-import requests
+import re
+import html
 import streamlit as st
-import pandas as pd
-from pipeline import FinanceAssistantPipeline
+
 import config
+import db
+import agent as agent_mod
+import explainer
+import session as session_mod
 
-API_URL = os.getenv("API_URL", "http://localhost:8000")
+st.set_page_config(page_title="Finance Assistant", page_icon="💸",
+                   layout="wide", initial_sidebar_state="expanded")
 
-def escape_markdown_currency(text: str) -> str:
-    """
-    Prevents Streamlit from misinterpreting currency numbers like $71,468.17 ... $23,822.72
-    as LaTeX KaTeX math formulas (which strips spaces and italicizes text).
-    Sanitizes HTML characters (&, <, >) to prevent XSS injection, then replaces
-    literal '$' with HTML entity '&#36;' so KaTeX math is completely bypassed.
-    """
-    if not text:
-        return ""
-    safe = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return safe.replace("$", "&#36;")
-
-# Set Page Config
-st.set_page_config(
-    page_title="Finance Intelligence Assistant",
-    page_icon="💼",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Custom CSS for executive financial styling
 st.markdown("""
 <style>
-    .main { background-color: #0f172a; }
-    .stMetric { background-color: #1e293b; padding: 10px; border-radius: 8px; border: 1px solid #334155; }
-    .badge-high { color: #10b981; font-weight: bold; }
-    .badge-med { color: #f59e0b; font-weight: bold; }
-    .badge-low { color: #ef4444; font-weight: bold; }
+  .stApp { background: #0d1117; }
+  div[data-testid="stMetric"] { background:#161b22; border:1px solid #30363d;
+      border-radius:10px; padding:12px 14px; }
+  .interp { background:#12203a; border-left:3px solid #388bfd; padding:8px 12px;
+      border-radius:4px; font-size:0.86rem; color:#c9d1d9; margin:6px 0 10px; }
+  .note { background:#1c1a10; border-left:3px solid #d29922; padding:8px 12px;
+      border-radius:4px; font-size:0.84rem; color:#e3d5a8; margin:4px 0; }
+  .grd { font-size:0.78rem; color:#7d8590; margin-top:6px; }
+  .conf { display:inline-block; font-size:0.8rem; padding:3px 10px; border-radius:12px;
+      margin:6px 0; border:1px solid; }
+  .conf-sub { opacity:0.75; font-weight:400; }
+  .conf-hi { color:#3fb950; border-color:#238636; background:#0f2417; }
+  .conf-md { color:#d29922; border-color:#9e6a03; background:#241d0f; }
+  .conf-lo { color:#f85149; border-color:#8b2c25; background:#2a1416; }
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize Pipeline Cache
-@st.cache_resource
-def get_pipeline():
-    return FinanceAssistantPipeline()
 
-pipeline = get_pipeline()
-
-def check_backend_health():
-    """Checks if the FastAPI server is running on port 8000."""
-    try:
-        r = requests.get(f"{API_URL}/api/health", timeout=0.8)
-        if r.status_code == 200:
-            return True, r.json()
-    except Exception:
-        pass
-    return False, None
-
-def execute_financial_query(user_query: str, chat_history: list) -> dict:
+def esc(text: str) -> str:
     """
-    Dispatches query:
-    1. If FastAPI backend is live (http://localhost:8000), sends HTTP POST /api/query.
-    2. If offline, seamlessly executes via local in-memory pipeline.
+    Escapes HTML, then neutralises '$' so Streamlit's KaTeX does not treat
+    'Rs 1,234 ... Rs 5,678' as inline maths and swallow the text between.
     """
-    clean_history = []
-    for m in chat_history:
-        if isinstance(m, dict) and "role" in m and "content" in m:
-            clean_history.append({"role": m["role"], "content": m["content"]})
+    if not text:
+        return ""
+    s = html.escape(str(text))
+    return s.replace("$", "&#36;")
 
-    api_online, health_data = check_backend_health()
-    if api_online:
-        try:
-            payload = {"query": user_query, "chat_history": clean_history}
-            resp = requests.post(f"{API_URL}/api/query", json=payload, timeout=45.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("table"):
-                    data["table"] = pd.DataFrame(data["table"])
-                else:
-                    data["table"] = None
-                data["backend_source"] = f"FastAPI REST API ({API_URL}/api/query)"
-                return data
-        except Exception:
-            pass  # Fall back to in-process pipeline on network error
+def esc_inline(text: str) -> str:
+    """
+    Same, but keeps **bold** working.
 
-    # Direct In-Process Engine
-    data = pipeline.process_query(user_query, chat_history=clean_history)
-    data["backend_source"] = "In-Process DuckDB Engine"
-    return data
+    Markdown is not processed inside a raw HTML block, so the banners rendered
+    via <div> would otherwise show literal asterisks.
+    """
+    return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", esc(text))
 
-# -------------------------------------------------------------
-# SIDEBAR: EVALUATION METRICS & PRE-BUILT DEMO PROMPTS
-# -------------------------------------------------------------
+
+@st.cache_resource(show_spinner=False)
+def get_connection():
+    return db.connect(read_only=True)
+
+
+@st.cache_resource(show_spinner=False)
+def get_session(_con):
+    """The logged-in customer. Hardcoded in session.py for the prototype."""
+    return session_mod.load(_con)
+
+
+if not os.path.exists(config.WAREHOUSE_PATH):
+    st.error("No warehouse found. Build one first:")
+    st.code("python data_generator.py --rows 200000\npython build_warehouse.py", language="bash")
+    st.stop()
+
+con = get_connection()
+sess = get_session(con)
+entity_id = sess.entity_id
+anchor = db.get_anchor_date(con)
+
+# ---------------------------------------------------------------- sidebar
 with st.sidebar:
-    st.title("💼 Finance Assistant")
-    st.caption("Internal Spend, Payouts & Reconciliation")
-    
-    st.markdown("---")
-    st.subheader("💡 Suggested Inquiries")
-    
-    suggested_queries = [
-        "How much did we spend on Acme Corporation in May 2024?",
-        "What was our total spend on AWS last month?",
-        "Which transactions are still unreconciled?",
-        "Show pending reconciliation transactions",
-        "Show total spend by category",
-        "What did we pay Netflix last month?",
-        "How much did we spend on Amazon?"
-    ]
-    for q in suggested_queries:
-        if st.button(q, key=f"btn_{q}", use_container_width=True):
-            st.session_state.trigger_query = q
+    st.title("💸 Finance Assistant")
+    st.caption("Ask about your spending in plain language.")
 
-    st.markdown("---")
-    api_online, health_data = check_backend_health()
-    st.subheader("🔌 Backend Architecture")
-    if api_online:
-        st.success("🟢 **FastAPI REST API**: Connected (`:8000`)")
-        st.caption(f"Routing via `POST {API_URL}/api/query`  \nAnchor Date: `{health_data.get('anchor_date')}`")
-    else:
-        st.info("⚡ **Direct Mode**: In-Process Engine")
-        st.caption("Run `py api.py` to route queries over HTTP REST.")
+    st.markdown(f"**Signed in as** {sess.display_name}")
+    st.caption(f"Primary account **{sess.masked_number}** · {sess.bank_name}  \n"
+               f"{sess.account_count} account(s) on file")
+
+    st.caption(f"Data through **{anchor}** — relative dates resolve against this, "
+               f"not today's date.")
+
+    st.divider()
+    st.caption("**Try asking**")
+    for q in ["How much have I spent on Swiggy last month?",
+              "How much have I spent on Zomato total?",
+              "Which vendor have I spent on the most?",
+              "How much did my friend pay me in the last 3 months?",
+              "I want to calculate my spending for swiggy",
+              "How does that compare to the month before?",
+              "What did I spend on Oracle?",
+              "Show my balance"]:
+        if st.button(q, key=f"s_{q}", use_container_width=True):
+            st.session_state.queued = q
+
+    st.divider()
+    llm_on = bool(os.getenv("GROQ_API_KEY", config.GROQ_API_KEY))
+    st.caption(f"Planner: **{'LLM + rules fallback' if llm_on else 'rules only (no API key)'}**")
+    st.caption(f"Model: `{config.ACTIVE_MODEL}`")
 
     with st.expander("📄 Note on Model Choice (Section 7 Compliant)"):
         st.markdown(f"**Active Model**: `{config.ACTIVE_MODEL}` (Groq)")
         st.markdown("**Section 7 Constraint Compliance**:")
         st.caption("• **<= 20B Upper Limit**: `openai/gpt-oss-20b` adheres strictly to the 20B parameter ceiling.\n• **20M Record Scalability**: Arithmetic and joins are offloaded to vectorized DuckDB OLAP, built for 20M+ records.\n• **Cost & Speed**: ~$0.0002/query at 500+ tok/s with <5ms database math.")
-        st.markdown("**Benchmark Accuracy**:")
-        st.caption("100% (13/13 automated edge-case test cases passed, 0% math error).")
 
-    with st.expander("🔌 Backend REST API (FastAPI)"):
-        st.markdown("**Server File**: `api.py` (FastAPI)")
-        st.markdown("**Interactive Swagger UI**: `http://localhost:8000/docs`")
-        st.markdown("**Production Endpoints**:")
-        st.caption("• `POST /api/query`: Natural language query pipeline\n• `GET /api/health`: Database health & anchor date\n• `GET /api/vendors`: Canonical vendor records\n• `GET /api/reconciliation/stats`: Multi-state breakdown")
-
-    st.markdown("---")
-    if st.button("🗑️ Clear Conversation", use_container_width=True):
+    if st.button("🗑 Clear conversation", use_container_width=True):
         st.session_state.messages = []
+        st.session_state.pending = None
         st.rerun()
 
-# -------------------------------------------------------------
-# MAIN CHAT APPLICATION
-# -------------------------------------------------------------
-st.title("💼 Conversational Financial Assistant")
-st.markdown(
-    "Ask routine questions about vendor spend, payout status, and reconciliation. "
-    "Every answer is **100% grounded in real data**, pre-computed mathematically before explanation."
-)
-
+# ---------------------------------------------------------------- state
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "pending" not in st.session_state:
+    st.session_state.pending = None
 
-# Render conversation history
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(escape_markdown_currency(msg["content"]), unsafe_allow_html=True)
-        
-        # Confidence Signalling: Flag when less certain (Bonus Requirement)
-        conf = msg.get("confidence", 1.0)
-        if conf < 0.90 and conf > 0.0:
-            st.info(f"⚖️ **Confidence Signal**: **{msg.get('confidence_label', 'Moderate')}** — {msg.get('confidence_desc', '')}")
-        
-        # Display anomalies if any
-        if msg.get("anomalies"):
-            for alert in msg["anomalies"]:
-                st.warning(escape_markdown_currency(alert))
-                
-        # Display verifiable table if available
-        if msg.get("table") is not None and not msg["table"].empty:
-            st.markdown("##### 🔍 Verifiable Underlying Records")
-            st.dataframe(msg["table"], use_container_width=True)
-            
-            # CSV Download
-            csv_data = msg["table"].to_csv(index=False).encode("utf-8")
-            st.download_button(
-                label="📥 Export Breakdown to CSV",
-                data=csv_data,
-                file_name="financial_records.csv",
-                mime="text/csv",
-                key=f"dl_{hash(msg['content'])}"
-            )
-            
-        # Display explainability trace
-        if msg.get("sql"):
-            with st.expander("🛠️ Grounded Audit Trace & Executed SQL"):
-                st.code(msg["sql"], language="sql")
-                conf = msg.get("confidence", 1.0)
-                conf_label = msg.get("confidence_label", "High Certainty")
-                lat = msg.get("latency_ms", 0.0)
-                src = msg.get("backend_source", "DuckDB Engine")
-                st.caption(f"Execution Latency: **{lat} ms** | Confidence: **{conf_label} ({int(conf*100)}%)** | Backend: **{src}**")
 
-# Handle input (either typed or triggered from sidebar)
-user_prompt = st.chat_input("Ask a question about spend, payouts, or reconciliation...")
-if hasattr(st.session_state, "trigger_query") and st.session_state.trigger_query:
-    user_prompt = st.session_state.trigger_query
-    st.session_state.trigger_query = None
 
-if user_prompt:
-    # Append user message
-    st.session_state.messages.append({"role": "user", "content": user_prompt})
+@st.cache_resource(show_spinner=False)
+def get_agent(_con, _sess, entity):
+    return agent_mod.FinanceAgent(_con, session=_sess)
+
+
+bot = get_agent(con, sess, entity_id)
+
+st.title("Conversational Finance Assistant")
+st.caption("Every number is computed by the database. The model explains results — "
+           "it never calculates them, and figures it cannot ground are discarded.")
+
+
+def render(msg, key):
+    """Renders one assistant turn."""
+    st.markdown(esc(msg.get("content", "")), unsafe_allow_html=True)
+
+    conf = msg.get("confidence")
+    if conf:
+        # Band only. A precise-looking percentage invites the reader to treat a
+        # combination of heuristics as a measurement; the band plus the reasons
+        # says what is actually known.
+        cls = {"High": "conf-hi", "Medium": "conf-md"}.get(conf["label"], "conf-lo")
+        dot = {"High": "●", "Medium": "◐"}.get(conf["label"], "○")
+        blurb = {
+            "High": "interpreted unambiguously",
+            "Medium": "one or more details were assumed",
+            "Low": "worth checking the interpretation below",
+        }.get(conf["label"], "")
+        st.markdown(
+            f"<div class='conf {cls}'>{dot} <strong>{conf['label']} confidence</strong>"
+            f"<span class='conf-sub'> — {blurb}</span></div>",
+            unsafe_allow_html=True)
+        if conf.get("reasons"):
+            with st.expander("How was this confidence determined?"):
+                for reason in conf["reasons"]:
+                    st.markdown(f"- {reason}")
+                st.caption("Amounts are computed by the database and are exact. "
+                           "Confidence reflects how the question was interpreted — "
+                           "the counterparty, the date window, and how much of the "
+                           "underlying data could be attributed.")
+
+    if msg.get("interpretation"):
+        st.markdown(f"<div class='interp'>{esc_inline(msg['interpretation'])}</div>",
+                    unsafe_allow_html=True)
+    if msg.get("inherited"):
+        bits = ", ".join(f"{k} = **{v}**" for k, v in msg["inherited"].items())
+        st.markdown(f"<div class='interp'>↩ Carried over from your previous "
+                    f"question: {esc_inline(bits)}</div>", unsafe_allow_html=True)
+    for n in msg.get("notes", []):
+        st.markdown(f"<div class='note'>⚠ {esc_inline(n)}</div>", unsafe_allow_html=True)
+
+    facts = msg.get("facts") or {}
+    if facts.get("grand_total") is not None and msg.get("kind") != "list":
+        c = st.columns(4)
+        c[0].metric("Total", explainer.money(facts["grand_total"]))
+        if facts.get("txn_count") is not None:
+            c[1].metric("Transactions", f"{facts['txn_count']:,}")
+        if facts.get("average"):
+            c[2].metric("Average", explainer.money(facts["average"]))
+        if facts.get("group_count"):
+            c[3].metric("Counterparties", f"{facts['group_count']:,}")
+
+    rows = msg.get("rows")
+    if rows is not None and not rows.empty:
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.download_button("⬇ Export CSV", rows.to_csv(index=False).encode("utf-8"),
+                           file_name="transactions.csv", mime="text/csv",
+                           key=f"dl_{key}")
+
+    if msg.get("trace"):
+        with st.expander("🔍 Audit trace"):
+            for step in msg["trace"]:
+                s = step.get("step")
+                if s == "plan":
+                    st.markdown(f"**1. Plan** — planner `{step['planner']}` → "
+                                f"tool `{step['tool']}`")
+                    st.json(step["args"], expanded=False)
+                elif s == "resolve_merchant":
+                    st.markdown(f"**Resolve counterparty** — `{step['input']}` → "
+                                f"**{step.get('resolved')}** "
+                                f"({step.get('status')}, {step.get('method')}, "
+                                f"confidence {step.get('confidence')})")
+                elif s == "resolve_person":
+                    st.markdown(f"**Resolve person** — {step.get('status')}: "
+                                f"{step.get('candidates')}")
+                elif s == "resolve_period":
+                    st.markdown(f"**Resolve period** — `{step.get('input')}` → "
+                                f"**{step.get('label')}** "
+                                f"(`{step.get('window')}`, month-aligned: "
+                                f"{step.get('month_aligned')})")
+                elif s == "policy_gate":
+                    st.markdown(f"**Policy gate fired** — `{step.get('gate')}` "
+                                f"→ asked the user instead of guessing")
+                elif s == "query":
+                    st.markdown(f"**Query** — source `{step.get('source')}`, "
+                                f"{step.get('rows')} rows, {step.get('ms')} ms")
+                    st.code(step.get("sql", ""), language="sql")
+                elif s == "narrate":
+                    st.markdown(f"**Narration** — `{step.get('method')}`")
+            meta = msg.get("meta", {})
+            st.caption(f"Turn latency **{meta.get('latency_ms', 0):.0f} ms** · "
+                       f"planner **{meta.get('planner')}** · "
+                       f"narration **{meta.get('narration')}** · "
+                       f"confidence **{(msg.get('confidence') or {}).get('label', 'High')}**")
+
+    if msg.get("narration") == "llm_rejected":
+        st.markdown("<div class='grd'>⚑ The model produced a figure the database "
+                    "did not return, so its wording was discarded and a verified "
+                    "template was used instead.</div>", unsafe_allow_html=True)
+
+
+for i, m in enumerate(st.session_state.messages):
+    with st.chat_message(m["role"]):
+        if m["role"] == "user":
+            st.markdown(esc(m["content"]), unsafe_allow_html=True)
+        else:
+            render(m, key=i)
+
+# ---------------------------------------------------------------- input
+prompt = st.chat_input("Ask about your spending…")
+if st.session_state.get("queued"):
+    prompt = st.session_state.pop("queued")
+if st.session_state.get("chosen"):
+    prompt = st.session_state.pop("chosen")
+
+if prompt:
+    st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
-        st.markdown(user_prompt)
+        st.markdown(esc(prompt), unsafe_allow_html=True)
 
-    # Process query through backend dispatcher (FastAPI HTTP or In-Process fallback)
+    history = [{"role": m["role"], "content": m.get("content", ""),
+                "context": m.get("context", {})}
+               for m in st.session_state.messages]
+
     with st.chat_message("assistant"):
-        with st.spinner("Querying analytical database..."):
-            result = execute_financial_query(user_prompt, chat_history=st.session_state.messages)
+        with st.spinner("Querying…"):
+            res = bot.run(prompt, history=history, pending=st.session_state.pending)
 
-            # 1. Main Answer
-            st.markdown(escape_markdown_currency(result["answer"]), unsafe_allow_html=True)
+        msg = {"role": "assistant", "trace": res.trace,
+               "meta": {"latency_ms": res.latency_ms, "planner": res.planner,
+                        "narration": res.narration},
+               "narration": res.narration, "kind": res.kind,
+               "context": res.pending or {},
+               "inherited": res.inherited or {},
+               "confidence": {"pct": res.confidence.pct,
+                              "label": res.confidence.label,
+                              "reasons": res.confidence.reasons}}
 
-            # Confidence Signalling: Flag when less certain (Bonus Requirement)
-            conf = result.get("confidence", 1.0)
-            if conf < 0.90 and conf > 0.0:
-                st.info(f"⚖️ **Confidence Signal**: **{result.get('confidence_label', 'Moderate')}** — {result.get('confidence_desc', '')}")
+        if res.status == agent_mod.CLARIFY:
+            st.session_state.pending = {**(res.pending or {}),
+                                        "question": res.question,
+                                        "options": res.options}
+            msg["content"] = res.question
+            msg["options"] = res.options
+        else:
+            st.session_state.pending = None
+            msg["content"] = res.answer
+            if res.result is not None:
+                msg["rows"] = res.result.rows
+                msg["facts"] = res.result.facts
+                msg["notes"] = res.result.notes
+                fl = res.result.filters or {}
+                bits = []
+                if fl.get("merchant"):
+                    bits.append(f"counterparty **{fl['merchant']}**")
+                if fl.get("period"):
+                    bits.append(f"period **{fl['period']}**")
+                if fl.get("direction"):
+                    bits.append("money **out**" if fl["direction"] == config.TXN_DEBIT
+                                else "money **in**")
+                if bits:
+                    msg["interpretation"] = "Interpreted as " + ", ".join(bits) + "."
 
-            # 2. Anomaly Alerts (Bonus)
-            if result.get("anomalies"):
-                for alert in result["anomalies"]:
-                    st.warning(escape_markdown_currency(alert))
+        st.session_state.messages.append(msg)
+        render(msg, key=len(st.session_state.messages))
 
-            # 3. Verifiable Records Table (Must Have)
-            df = result.get("table")
-            if df is not None and not df.empty:
-                st.markdown("##### 🔍 Verifiable Underlying Records")
-                st.dataframe(df, use_container_width=True)
-
-                # 4. CSV Download (Good to Have)
-                csv_bytes = df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    label="📥 Export Breakdown to CSV",
-                    data=csv_bytes,
-                    file_name="financial_records.csv",
-                    mime="text/csv",
-                    key=f"dl_{len(st.session_state.messages)}"
-                )
-
-            # 5. Explainability Drawer (Must Have)
-            if result.get("sql"):
-                with st.expander("🛠️ Grounded Audit Trace & Executed SQL"):
-                    st.code(result["sql"], language="sql")
-                    conf = result.get("confidence", 1.0)
-                    conf_label = result.get("confidence_label", "High Certainty")
-                    lat = result.get("latency_ms", 0.0)
-                    src = result.get("backend_source", "DuckDB Engine")
-                    st.caption(f"Execution Latency: **{lat} ms** | Confidence: **{conf_label} ({int(conf*100)}%)** | Backend: **{src}**")
-
-            # Store in session state
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": result["answer"],
-                "table": df,
-                "sql": result.get("sql"),
-                "confidence": result.get("confidence"),
-                "confidence_label": result.get("confidence_label"),
-                "confidence_desc": result.get("confidence_desc"),
-                "latency_ms": result.get("latency_ms"),
-                "anomalies": result.get("anomalies"),
-                "backend_source": result.get("backend_source")
-            })
-
+# Clarification options render as buttons on the latest assistant turn.
+last = st.session_state.messages[-1] if st.session_state.messages else None
+if last and last.get("role") == "assistant" and last.get("options"):
+    cols = st.columns(min(len(last["options"]), 6))
+    for i, opt in enumerate(last["options"][:6]):
+        if cols[i % len(cols)].button(opt, key=f"opt_{len(st.session_state.messages)}_{i}",
+                                      use_container_width=True):
+            st.session_state.chosen = opt
+            st.rerun()

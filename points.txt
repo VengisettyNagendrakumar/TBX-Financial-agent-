@@ -1,0 +1,11 @@
+- No predictions
+- Each vendor/person will have a unique entity_id, with multiple account_ids
+- They will expose a data url and that we have to connect to and import data from
+- GST questions - how much did I spend on GST in the last month? 
+
+
+1. Switch to LangGraph
+2. Add pipeline to ingest from database url
+3. Update user model - user should have 1 entity_id which may have multiple accounts. Similarly vendors may also have multiple account ids but only 1 entity_id
+4. We should be able to start multiple chats and store their history
+5. Test anamoly detection - ensure it is working properly

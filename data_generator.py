@@ -1,266 +1,262 @@
 """
-Synthetic Financial Dataset Generator
-Generates realistic financial data reflecting the TBX - BVP Hackathon Problem Statement:
-- vendor_list.csv (with intentional variants and ambiguous names)
-- chart_of_accounts.csv (income/expense/asset accounts)
-- transactions.csv (ledger entries across 4 months)
-- vendor_payouts.csv (outbound payouts across all months + intentional spend spike anomaly)
-- reconciliation_status.csv (reconciliation states: Reconciled, Unreconciled, Pending, Disputed)
+Synthetic Dataset Generator (V2 — bank / account / transaction)
+================================================================
+Generates data matching the hackathon schema, with narration strings that
+reproduce the real formats seen in the provided sample:
+
+    UPI-NAVYUG SELECTION-XXXXXX8672-AUBL0002125-103293775381-260514201735136
+    NEFT  - UTIB0002678 - 95604250 - 915020031685136 - UMANG SELECTIONHAPUR
+    IMPS/P2A/600228462725/UTIB/918020101986700/00/INET/9211/SELECTIONMALIGAI/...
+    IMPS OW/507614422198/Gautam singh/SBIN/43292707719
+    FT -  95842568 -  50200013729069 - SELECTION ELECTRONICS   DAHISAR EAST
+    R/RATNR52025121600100235/ZBFLCTP405PBL15667333//SELECTRICITY TWO PRIVATE...
+    NEFT/000483399203/ICIC/PARESH VIKRANT GHASE
+
+Generation runs *inside DuckDB* rather than a Python loop: 4M rows take a couple
+of seconds vectorised, where a row-by-row loop takes minutes.
+
+The mix is deliberately imperfect. It includes brand/legal-name variants
+(BUNDL TECHNOLOGIES vs SWIGGY), legal suffixes, trailing city names, bank
+charges, self-transfers and a slice of genuinely unparseable narration, so that
+merchant-extraction coverage is a real measurement rather than 100% by
+construction.
+
+Usage:
+    python data_generator.py                        # 200k transactions
+    python data_generator.py --rows 4000000         # full scale
+    python data_generator.py --rows 5000 --format csv
 """
 
 import os
-import random
-import pandas as pd
-from datetime import datetime, timedelta
+import argparse
+import time
 
-def generate_datasets(output_dir="data", seed=42):
-    random.seed(seed)
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # 1. Vendor List (Includes tricky ambiguous variants)
-    vendors = [
-        {"vendor_id": "V001", "vendor_name": "Amazon Web Services, Inc.", "category": "Cloud Infrastructure"},
-        {"vendor_id": "V002", "vendor_name": "Amazon Logistics LLC", "category": "Shipping & Fulfillment"},
-        {"vendor_id": "V003", "vendor_name": "Acme Corporation", "category": "Enterprise Software"},
-        {"vendor_id": "V004", "vendor_name": "CloudScale Technologies", "category": "DevOps & Monitoring"},
-        {"vendor_id": "V005", "vendor_name": "Cloudflare Inc.", "category": "Security & CDN"},
-        {"vendor_id": "V006", "vendor_name": "Stripe Payments", "category": "Payment Processing"},
-        {"vendor_id": "V007", "vendor_name": "Salesforce.com Inc.", "category": "Sales & CRM"},
-        {"vendor_id": "V008", "vendor_name": "Deloitte Advisory", "category": "Audit & Legal"},
-        {"vendor_id": "V009", "vendor_name": "WeWork Global", "category": "Office & Facilities"},
-        {"vendor_id": "V010", "vendor_name": "Google Cloud Platform", "category": "Cloud Infrastructure"},
-        {"vendor_id": "V011", "vendor_name": "Datadog Inc.", "category": "Observability"},
-        {"vendor_id": "V012", "vendor_name": "Slack Technologies", "category": "Productivity"}
-    ]
-    df_vendors = pd.DataFrame(vendors)
-    df_vendors.to_csv(os.path.join(output_dir, "vendor_list.csv"), index=False)
-    
-    # 2. Chart of Accounts
-    accounts = [
-        {"account_id": "ACC-6001", "account_name": "Software & SaaS Subscriptions", "account_type": "Expense"},
-        {"account_id": "ACC-6002", "account_name": "Hosting & Infrastructure", "account_type": "Expense"},
-        {"account_id": "ACC-6003", "account_name": "Legal & Professional Fees", "account_type": "Expense"},
-        {"account_id": "ACC-6004", "account_name": "Office Rent & Facilities", "account_type": "Expense"},
-        {"account_id": "ACC-6005", "account_name": "Shipping & Logistics", "account_type": "Expense"},
-        {"account_id": "ACC-6006", "account_name": "Payment Gateway Fees", "account_type": "Expense"},
-        {"account_id": "ACC-2001", "account_name": "Accounts Payable", "account_type": "Liability"},
-        {"account_id": "ACC-1001", "account_name": "Operating Cash Account", "account_type": "Asset"}
-    ]
-    df_accounts = pd.DataFrame(accounts)
-    df_accounts.to_csv(os.path.join(output_dir, "chart_of_accounts.csv"), index=False)
+import duckdb
 
-    # 3. Vendor Payouts: Guarantee consistent distribution across Feb, Mar, Apr, and May 2024
-    # Anchor date: 2024-05-31
-    months = [
-        (datetime(2024, 2, 1), datetime(2024, 2, 28)),
-        (datetime(2024, 3, 1), datetime(2024, 3, 31)),
-        (datetime(2024, 4, 1), datetime(2024, 4, 30)), # April (Last Month relative to May)
-        (datetime(2024, 5, 1), datetime(2024, 5, 30))  # May (Current Month)
-    ]
+import config
 
-    payouts = []
-    payout_id_counter = 1001 #used to generate ids pay-1001 pay-1002 etc
-    
-    baseline_spend = {
-        "V001": (12000, 1500), # AWS ~12k (mean amount,std deviation)
-        "V002": (4500, 800),   # Amazon Logistics ~4.5k
-        "V003": (6200, 600),   # Acme Corp ~6.2k
-        "V004": (3500, 400),   # CloudScale ~3.5k
-        "V005": (1800, 200),   # Cloudflare ~1.8k
-        "V006": (8500, 1200),  # Stripe ~8.5k
-        "V007": (9000, 500),   # Salesforce ~9k
-        "V008": (15000, 3000), # Deloitte ~15k
-        "V009": (11000, 500),  # WeWork ~11k
-        "V010": (7000, 1000),  # GCP ~7k
-        "V011": (2200, 300),   # Datadog ~2.2k
-        "V012": (1500, 150)    # Slack ~1.5k
-    }
+# Merchants a user would ask about by brand name.
+MERCHANTS = [
+    "SWIGGY", "ZOMATO", "AMAZON", "FLIPKART", "BLINKIT", "MYNTRA", "BIGBASKET",
+    "DMART", "RELIANCE DIGITAL", "CROMA", "IRCTC", "MAKEMYTRIP", "UBER",
+    "OLA", "RAPIDO", "BOOKMYSHOW", "NETFLIX", "SPOTIFY", "JIO", "AIRTEL",
+    "TATA POWER", "APOLLO PHARMACY", "PHARMEASY", "NYKAA", "DECATHLON",
+    "STARBUCKS", "DOMINOS", "MCDONALDS", "HALDIRAM", "SELECTION ELECTRONICS",
+    "NAVYUG SELECTION", "SELECTRICITY TWO", "UMANG SELECTION", "LENSKART",
+    "URBAN COMPANY", "ZEPTO", "LICIOUS", "CULT FIT", "INDIGO", "VISTARA",
+]
 
-    # Ensure EVERY vendor has payouts in EVERY month (Feb, Mar, Apr, May)
-    for vendor in vendors:
-        v_id = vendor["vendor_id"]
-        mean_amt, std_amt = baseline_spend[v_id]
-        
-        for m_start, m_end in months: #for every vendor the 4 motnths 
-            m_days = (m_end - m_start).days
-            # 1 to 2 payouts per month
-            for _ in range(random.randint(1, 2)):
-                p_date = m_start + timedelta(days=random.randint(1, m_days)) #create a random date in the month i.e April 1 + 12 days
-                amt = round(max(300.0, random.gauss(mean_amt, std_amt)), 2) #random.gauss(mean_amt, std_amt) generates a random number from a Gaussian/normal distribution. might genrate 11,323
-                status = random.choices(["Completed", "Pending", "Failed"], weights=[0.90, 0.07, 0.03])[0] #random.choices() returns a list. so we take the first element of the list to get the selected status.
-                #[0.90, 0.07, 0.03] means in 100 90 are completed and 7 are pending 3 failed Because real financial systems generally don't have every payout in the same status.
-                payouts.append({
-                    "payout_id": f"PAY-{payout_id_counter}",
-                    "payout_date": p_date.strftime("%Y-%m-%d"),
-                    "vendor_id": v_id,
-                    "amount": amt,
-                    "currency": "USD",
-                    "status": status,
-                    "description": f"Payout to {vendor['vendor_name']} for monthly services"
-                })
-                payout_id_counter += 1
+# Legal-entity names that must fold onto a brand via config.MERCHANT_ALIASES.
+# If normalisation misses these, Swiggy spend silently splits in two.
+LEGAL_VARIANTS = [
+    "BUNDL TECHNOLOGIES", "SWIGGY INSTAMART", "ETERNAL", "ZOMATO MEDIA",
+    "BLINK COMMERCE", "AMAZON SELLER SERVICES", "FLIPKART INTERNET",
+    "UBER INDIA SYSTEMS", "ANI TECHNOLOGIES",
+]
 
-    # INTENTIONAL SPEND SPIKE (ANOMALY):
-    # Acme Corp regular is ~6,200. $58,500 enterprise license spike on May 24, 2024!
-    payouts.append({ #You intentionally inject an anomaly.Normal Acme spending: ~$6,200. Anomalous spike: $58,500 on May 24, 2024. so model will show that
-        "payout_id": f"PAY-{payout_id_counter}",
-        "payout_date": "2024-05-24",
-        "vendor_id": "V003", # Acme Corp
-        "amount": 58500.00,
-        "currency": "USD",
-        "status": "Completed",
-        "description": "Acme Corp Enterprise Global License Renewal (Spike Anomaly)"
-    })
-    payout_id_counter += 1
+# Individuals — these drive "how much did my friend pay me".
+PERSONS = [
+    "Gautam Singh", "Paresh Vikrant Ghase", "Ananya Sharma", "Rohit Mehta",
+    "Priya Nair", "Vikram Iyer", "Sneha Kulkarni", "Arjun Patel",
+    "Meera Krishnan", "Sanjay Gupta", "Divya Reddy", "Karan Malhotra",
+]
 
-    # Ensure AWS also has a specific payout on the anchor date (2024-05-31)
-    payouts.append({  #It gives your application a known reference point for questions involving: current month, last month, and anchor date. This is useful for testing and validation.
-        "payout_id": f"PAY-{payout_id_counter}",
-        "payout_date": "2024-05-31",
-        "vendor_id": "V001",
-        "amount": 13420.50,
-        "currency": "USD",
-        "status": "Completed",
-        "description": "AWS Monthly Compute charges for May"
-    })
-    payout_id_counter += 1
+BANK_CHARGES = [
+    "IMPS charges", "NEFT CHARGES", "AMC FEE", "SMS ALERT CHARGES",
+    "GST ON CHARGES", "ATM FEE", "MIN BAL PENALTY", "ANNUAL FEE",
+]
 
-    df_payouts = pd.DataFrame(payouts).sort_values("payout_date")
-    df_payouts.to_csv(os.path.join(output_dir, "vendor_payouts.csv"), index=False)
+CITIES = [
+    "DAHISAR EAST", "SAKET DELHI", "KORAMANGALA", "ANDHERI WEST", "HAPUR",
+    "BANJARA HILLS", "SALT LAKE", "VIMAN NAGAR", "T NAGAR", "MALIGAI",
+]
 
-    # 4. General Transactions (Ledger Entries)
-    transactions = []
-    txn_id_counter = 50001
-    
-    vendor_account_map = { #it says Which accounting account should each vendor's transaction belong to?
-                        #   V001 AWS
-                        #     ↓
-                        #     ACC-6002
-                        #     ↓
-                        #     Hosting & Infrastructure
-        "V001": "ACC-6002", "V002": "ACC-6005", "V003": "ACC-6001",
-        "V004": "ACC-6002", "V005": "ACC-6002", "V006": "ACC-6006",
-        "V007": "ACC-6001", "V008": "ACC-6003", "V009": "ACC-6004",
-        "V010": "ACC-6002", "V011": "ACC-6001", "V012": "ACC-6001"
-    }
+SUFFIXES = ["", "", "", " PRIVATE LIMITED", " LTD", " PVT LTD", " LIMITED"]
 
-    for p in payouts:
-        transactions.append({
-            "transaction_id": f"TXN-{txn_id_counter}",
-            "transaction_date": p["payout_date"],
-            "vendor_id": p["vendor_id"],
-            "account_id": vendor_account_map[p["vendor_id"]],
-            "amount": p["amount"],
-            "transaction_type": "Debit",
-            "payout_id": p["payout_id"],
-            "description": p["description"]
-        })
-        txn_id_counter += 1
+BANKS = [
+    ("HDFC", "HDFC BANK LIMITED"), ("ICIC", "ICICI BANK LIMITED"),
+    ("SBIN", "STATE BANK OF INDIA"), ("UTIB", "AXIS BANK LIMITED"),
+    ("KKBK", "KOTAK MAHINDRA BANK LIMITED"), ("CNRB", "CANARA BANK"),
+    ("UBIN", "UNION BANK OF INDIA"), ("AUBL", "AU SMALL FINANCE BANK LIMITED"),
+    ("TMBL", "TAMILNAD MERCANTILE BANK LIMITED"), ("RATN", "RBL BANK LIMITED"),
+]
 
-    # Incidental transactions
-    for m_start, m_end in months:
-        m_days = (m_end - m_start).days
-        for _ in range(15):
-            t_date = m_start + timedelta(days=random.randint(1, m_days)) #Random date within the month.
-            v_entry = random.choice(vendors)
-            v_id = v_entry["vendor_id"]
-            amt = round(random.uniform(200.0, 4500.0), 2) #Unlike the payout generation, you're using uniform(), which gives a value from a roughly uniform distribution across that range.
-            transactions.append({
-                "transaction_id": f"TXN-{txn_id_counter}",
-                "transaction_date": t_date.strftime("%Y-%m-%d"),
-                "vendor_id": v_id,
-                "account_id": vendor_account_map[v_id],
-                "amount": amt,
-                "transaction_type": "Debit", #not every transcations are realted to vendors some transactions will not be vendors also suppose office expenses like that 
-                "payout_id": None, #This transaction does not correspond to a vendor payout. payout and 
-                "description": f"Incidental expense for {v_entry['vendor_name']}"
-            })
-            txn_id_counter += 1
 
-    df_txns = pd.DataFrame(transactions).sort_values("transaction_date")
-    df_txns.to_csv(os.path.join(output_dir, "transactions.csv"), index=False)
+def _sql_array(values):
+    escaped = [str(v).replace("'", "''") for v in values]
+    return "[" + ", ".join(f"'{v}'" for v in escaped) + "]"
 
-    # 5. Reconciliation Status
-    reconciliations = []
-    status_choices = ["Reconciled", "Unreconciled", "Pending", "Disputed"]
-    status_weights = [0.70, 0.18, 0.08, 0.04]
 
-    for t in transactions:
-        is_recent_may = t["transaction_date"] >= "2024-05-15"
-        if is_recent_may: #for recent transactions in May, we want to bias the status towards Pending or Unreconciled, since they may not have been reconciled yet. This simulates real-world scenarios where recent transactions are often still under review.
-            st = random.choices(status_choices, weights=[0.25, 0.45, 0.22, 0.08])[0]
+def generate(rows: int = 200_000, entities: int = 50, accounts: int = 200,
+             months: int = 24, out_dir: str = None, fmt: str = "parquet",
+             anchor: str = "2026-06-24", seed: int = 42) -> dict:
+    out_dir = out_dir or config.DATA_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    con = duckdb.connect(":memory:")
+    con.execute(f"SELECT setseed({(seed % 1000) / 1000.0});")
+
+    t0 = time.perf_counter()
+
+    # ---------- bank ----------
+    con.execute("CREATE TABLE bank (bank_code VARCHAR, bank_name VARCHAR);")
+    con.executemany("INSERT INTO bank VALUES (?, ?);", BANKS)
+
+    # ---------- account ----------
+    con.execute(f"""
+        CREATE TABLE account AS
+        SELECT
+            format('acc{{:08d}}-0000-4000-8000-{{:012d}}', i, i)      AS account_id,
+            format('ent{{:08d}}-0000-4000-8000-{{:012d}}',
+                   i % {entities}, i % {entities})                     AS entity_id,
+            (50200000000000 + i * 7919)::VARCHAR                       AS account_number,
+            ([21, 4, 46])[(i % 3) + 1]                                 AS program_id,
+            round((random() * 4000000 - 500000)::DECIMAL(15,2), 2)     AS available_balance,
+            ({_sql_array([b[0] for b in BANKS])})[(i % {len(BANKS)}) + 1] AS bank_code
+        FROM range(0, {accounts}) t(i);
+    """)
+
+    # ---------- transaction ----------
+    # Counterparty pools, chosen per row by a bucket on i.
+    con.execute(f"""
+        CREATE TABLE transaction AS
+        WITH base AS (
+            SELECT
+                i,
+                -- Independently salted hashes. Deriving everything from one
+                -- linear expression correlates account choice with merchant
+                -- choice, which leaves each entity transacting with only a
+                -- handful of merchants -- unrealistic, and it makes the
+                -- resolver look broken when it is not.
+                (hash(i::VARCHAR || 'acct')   % 1000000)::BIGINT AS h,
+                (hash(i::VARCHAR || 'when')   % 1000000)::BIGINT AS h_date,
+                (hash(i::VARCHAR || 'amount') % 1000000)::BIGINT AS h_amt,
+                (hash(i::VARCHAR || 'bucket') % 100)::BIGINT     AS bucket,
+                ({_sql_array(MERCHANTS)})[((hash(i::VARCHAR || 'm') % {len(MERCHANTS)})::BIGINT + 1)]        AS merchant,
+                ({_sql_array(LEGAL_VARIANTS)})[((hash(i::VARCHAR || 'lv') % {len(LEGAL_VARIANTS)})::BIGINT + 1)] AS legal_variant,
+                ({_sql_array(PERSONS)})[((hash(i::VARCHAR || 'p') % {len(PERSONS)})::BIGINT + 1)]           AS person,
+                ({_sql_array(BANK_CHARGES)})[((hash(i::VARCHAR || 'bc') % {len(BANK_CHARGES)})::BIGINT + 1)]  AS charge,
+                ({_sql_array(CITIES)})[((hash(i::VARCHAR || 'c') % {len(CITIES)})::BIGINT + 1)]              AS city,
+                ({_sql_array(SUFFIXES)})[((hash(i::VARCHAR || 's') % {len(SUFFIXES)})::BIGINT + 1)]         AS suffix,
+                ({_sql_array([b[0] for b in BANKS])})[((hash(i::VARCHAR || 'b') % {len(BANKS)})::BIGINT + 1)] AS ifsc_bank
+            FROM range(0, {rows}) t(i)
+        ),
+        typed AS (
+            -- counterparty bucket: 0-64 merchant, 65-74 legal variant,
+            -- 75-84 person, 85-90 bank charge, 91-93 self transfer,
+            -- 94-99 unparseable junk
+            SELECT * FROM base
+        )
+        SELECT
+            format('{{:08x}}-{{:04x}}-4{{:03x}}-8{{:03x}}-{{:012x}}',
+                   i, i % 65536, i % 4096, (i * 7) % 4096, i)          AS transaction_id,
+            format('acc{{:08d}}-0000-4000-8000-{{:012d}}',
+                   h % {accounts}, h % {accounts})                     AS account_id,
+            (TIMESTAMP '{anchor} 23:59:59'
+                - INTERVAL (h_date % {months * 30}) DAY
+                - INTERVAL (h_date % 86400) SECOND)                         AS transaction_date,
+            CASE WHEN bucket BETWEEN 75 AND 84 THEN 'credit'
+                 WHEN h % 23 = 0 THEN 'credit'
+                 ELSE 'debit' END                                      AS transaction_type,
+            CASE
+              WHEN bucket <= 64 THEN
+                CASE h % 6
+                  WHEN 0 THEN 'UPI-' || merchant || suffix || '-XXXXXX'
+                           || (h % 10000)::VARCHAR || '-' || ifsc_bank
+                           || '000' || (h % 9999)::VARCHAR || '-'
+                           || (500000000000 + h)::VARCHAR || '-2605142017'
+                  WHEN 1 THEN 'NEFT  - ' || ifsc_bank || '000' || (h % 9999)::VARCHAR
+                           || ' - ' || (95000000 + h)::VARCHAR
+                           || ' - ' || (915020031685136 + h)::VARCHAR
+                           || ' - ' || merchant || suffix
+                  WHEN 2 THEN 'IMPS/P2A/' || (600000000000 + h)::VARCHAR || '/'
+                           || ifsc_bank || '/' || (918020101986700 + h)::VARCHAR
+                           || '/00/INET/' || (h % 9999)::VARCHAR || '/'
+                           || merchant || '/ZBFLCTP5L2PBL' || (h % 99999)::VARCHAR || '/INWD48'
+                  WHEN 3 THEN 'FT -  ' || (95000000 + h)::VARCHAR || ' -  '
+                           || (50200013729069 + h)::VARCHAR || ' - '
+                           || merchant || '   ' || city
+                  WHEN 4 THEN 'R/' || ifsc_bank || 'R5' || (h % 999999)::VARCHAR
+                           || '/ZBFLCTP405PBL' || (h % 99999)::VARCHAR || '//'
+                           || merchant || suffix || '/REF' || (h % 9999)::VARCHAR
+                  ELSE 'NEFT/' || (h % 999999999)::VARCHAR || '/' || ifsc_bank
+                           || '/' || merchant || suffix
+                END
+              WHEN bucket <= 74 THEN
+                CASE h % 3
+                  WHEN 0 THEN 'UPI-' || legal_variant || '-XXXXXX' || (h % 10000)::VARCHAR
+                           || '-' || ifsc_bank || '0002125-' || (500000000000 + h)::VARCHAR
+                  WHEN 1 THEN 'NEFT  - ' || ifsc_bank || '0002678 - ' || (95000000 + h)::VARCHAR
+                           || ' - ' || (915020031685136 + h)::VARCHAR || ' - ' || legal_variant
+                  ELSE 'FT -  ' || (95000000 + h)::VARCHAR || ' -  '
+                           || (50200013729069 + h)::VARCHAR || ' - ' || legal_variant
+                           || ' PRIVATE LIMITED   ' || city
+                END
+              WHEN bucket <= 84 THEN
+                CASE h % 3
+                  WHEN 0 THEN 'IMPS OW/' || (500000000000 + h)::VARCHAR || '/' || person
+                           || '/' || ifsc_bank || '/' || (43292707719 + h)::VARCHAR
+                  WHEN 1 THEN 'NEFT/' || (h % 999999999)::VARCHAR || '/' || ifsc_bank || '/' || person
+                  ELSE 'UPI-' || person || '-XXXXXX' || (h % 10000)::VARCHAR
+                           || '-' || ifsc_bank || '0002125-' || (500000000000 + h)::VARCHAR
+                END
+              WHEN bucket <= 90 THEN charge
+              WHEN bucket <= 93 THEN
+                'FT - SELF - ' || (50200013729069 + h)::VARCHAR || ' - SELF TRANSFER'
+              ELSE
+                -- genuinely opaque narration: keeps coverage honest
+                CASE h % 3
+                  WHEN 0 THEN 'TRF/' || (h * 31)::VARCHAR || '/' || (h * 17)::VARCHAR
+                  WHEN 1 THEN 'CLG/' || (h % 999999)::VARCHAR
+                  ELSE 'MISC ADJ ' || (h % 99999)::VARCHAR
+                END
+            END                                                        AS description,
+            CASE WHEN bucket <= 90
+                 THEN round(((h_amt % 90000) + 100) / 10.0, 2)::DECIMAL(15,2)
+                 ELSE round(((h_amt % 500000) + 1000) / 10.0, 2)::DECIMAL(15,2)
+            END                                                        AS transaction_amount,
+            CASE WHEN h % 11 = 0 THEN NULL
+                 ELSE 'S' || (10000000 + h)::VARCHAR END               AS transaction_reference_id,
+            CASE WHEN h % 3 = 0 THEN NULL
+                 ELSE 'enc:' || md5((h * 7919)::VARCHAR) END           AS utr_number
+        FROM typed;
+    """)
+
+    ext = "parquet" if fmt == "parquet" else "csv"
+    written = {}
+    for table in ("bank", "account", "transaction"):
+        path = os.path.join(out_dir, f"{table}.{ext}").replace("\\", "/")
+        if ext == "parquet":
+            con.execute(f"COPY {table} TO '{path}' (FORMAT PARQUET, COMPRESSION ZSTD);")
         else:
-            st = random.choices(status_choices, weights=status_weights)[0]
-            
-        reconciliations.append({
-            "transaction_id": t["transaction_id"],
-            "reconciliation_status": st,
-            "reconciled_date": (datetime.strptime(t["transaction_date"], "%Y-%m-%d") + timedelta(days=random.randint(1, 5))).strftime("%Y-%m-%d") if st == "Reconciled" else None,
-            "notes": "Matched with bank feed" if st == "Reconciled" else ("Awaiting bank confirmation" if st == "Pending" else "Discrepancy in invoice total" if st == "Disputed" else "Unmatched in ledger")
-        })
+            con.execute(f"COPY {table} TO '{path}' (HEADER, DELIMITER ',');")
+        written[table] = (path, con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
-    df_recon = pd.DataFrame(reconciliations)
-    df_recon.to_csv(os.path.join(output_dir, "reconciliation_status.csv"), index=False)
+    elapsed = time.perf_counter() - t0
+    span = con.execute(
+        "SELECT MIN(transaction_date), MAX(transaction_date) FROM transaction"
+    ).fetchone()
+    mix = con.execute("""
+        SELECT transaction_type, COUNT(*) n FROM transaction GROUP BY 1 ORDER BY 2 DESC
+    """).fetchall()
+    con.close()
 
-    print(f"Generated synthetic dataset successfully in '{output_dir}':")
-    print(f"  - vendor_list.csv: {len(df_vendors)} vendors")
-    print(f"  - chart_of_accounts.csv: {len(df_accounts)} accounts")
-    print(f"  - vendor_payouts.csv: {len(df_payouts)} payouts")
-    print(f"  - transactions.csv: {len(df_txns)} transactions")
-    print(f"  - reconciliation_status.csv: {len(df_recon)} records")
-    print(f"  - Anchor Date: {df_payouts['payout_date'].max()}")
+    print(f"Generated in {elapsed:.1f}s -> {out_dir}")
+    for t, (p, n) in written.items():
+        print(f"  {t:12} {n:>10,} rows  {os.path.basename(p)}")
+    print(f"  date span    {span[0]} .. {span[1]}")
+    print(f"  type mix     {dict(mix)}")
+    print(f"  anchor date  {span[1].date()}")
+    return {"written": written, "elapsed": elapsed, "anchor": span[1]}
+
 
 if __name__ == "__main__":
-    generate_datasets()
-#anchor date as the "today" date of your dataset.Your generated financial data is historical data from around February → May 2024. The latest important date in the data is:2024-05-31So your application treats:2024-05-31 = today
-# Reconciliation basically means: Checking whether a financial transaction has been properly matched/verified against the corresponding financial record.
-
-#Why generate a reconciliation record for EVERY transaction?Your application needs to answer questions like: "Which transactions are still unreconciled?"
-
-# For example, imagine your company paid AWS:
-
-# Transaction
-
-# Your company's bank/ledger says:
-
-# AWS payment = $1,000
-
-# Transaction:
-# Amount = $1,000
-# Vendor = AWS
-
-# Now the company may have another record saying:
-
-# AWS invoice/payout = $1,000
-
-# That second record is what I meant by the matching record.
-
-# Company transaction       AWS invoice/payout
-#        $1,000       ↔          $1,000
-#           │                       │
-#           └────── MATCH ──────────┘
-
-# Because the amounts and relevant details match, the transaction can be marked:
-
-# Reconciled ✅
-
-
-# Reconciled
-# Transaction = $1,000
-# Matching record = $1,000
-
-# → Reconciled
-# Unreconciled
-# Transaction exists
-# but matching record hasn't been found
-
-# → Unreconciled
-# Pending
-# Matching/check is still being reviewed
-
-# → Pending
-# Disputed
-# Something doesn't match
-# and someone has flagged it
-
-# → Disputed
+    ap = argparse.ArgumentParser(description="Generate V2 synthetic bank data.")
+    ap.add_argument("--rows", type=int, default=200_000, help="transaction count")
+    ap.add_argument("--entities", type=int, default=50)
+    ap.add_argument("--accounts", type=int, default=200)
+    ap.add_argument("--months", type=int, default=24)
+    ap.add_argument("--format", choices=["parquet", "csv"], default="parquet")
+    ap.add_argument("--out", default=None)
+    args = ap.parse_args()
+    generate(rows=args.rows, entities=args.entities, accounts=args.accounts,
+             months=args.months, fmt=args.format, out_dir=args.out)
