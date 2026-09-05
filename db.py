@@ -1,165 +1,430 @@
 """
-Database Management & Anchor Date Engine
-========================================
-Handles DuckDB in-memory initialization, CSV loading, dynamic anchor date
-resolution, and query execution.
+Database Layer (V2)
+===================
+DuckDB connection management, source loading (files or MySQL-over-TLS), the
+dataset anchor date, and time-range resolution.
+
+Time-range resolution is a deliberate rewrite of the V1 function that caused
+BUGS.md B01. The V1 version returned (None, None) for BOTH "no period was
+requested" and "a period was requested but I could not parse it", and the query
+builder read that as "no filter" -- silently widening a one-month question to
+all-time and answering with a 16x-too-large number at High Certainty.
+
+Here those two cases are different statuses. An unparseable period returns
+UNRESOLVED, which callers must surface as a clarifying question rather than
+answering.
 """
 
 import os
+import re
+import glob
+import hashlib
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from typing import Optional
+
 import duckdb
-import pandas as pd
-from datetime import datetime, date
-from dateutil.relativedelta import relativedelta #from dateutil.relativedelta import relativedelta This is used for date arithmetic. anchor_date - relativedelta(months=1)means: Go back exactly one month. This is much safer for month calculations than simply subtracting 30 days.
+from dateutil.relativedelta import relativedelta
+
 import config
 
-def get_db_connection(): #Create the database and load all your CSV data into it.
-    """Returns a DuckDB connection with all CSV tables loaded."""
-    con = duckdb.connect(database=":memory:")
-    load_all_tables(con)
-    return con
+# =============================================================
+# CONNECTION
+# =============================================================
 
-def load_all_tables(con):
-    """Loads all CSV tables specified in config.py into DuckDB."""
-    for table_name, meta in config.SCHEMA_CONFIG.items():
-        csv_path = os.path.join(config.DATA_DIR, meta["file"]).replace("\\", "/") #C:/Hackathon/Bessemer Hackathon/data/transactions.csv
-        if os.path.exists(csv_path):
-            con.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM read_csv_auto('{csv_path}');")#read_csv_auto(...) This is a DuckDB function. It reads the CSV and automatically detects its structure/types. SELECT * FROM read_csv_auto(...) means Take everything from this CSV.so overall this line says "Read this CSV and create a DuckDB table from it."
-        else:
-            print(f"Warning: {csv_path} not found. Table {table_name} not loaded.")
+def connect(path: str = None, read_only: bool = False) -> duckdb.DuckDBPyConnection:
+    """Opens the persistent warehouse, or an in-memory DB when path is ':memory:'."""
+    target = path if path is not None else config.WAREHOUSE_PATH
+    if target == ":memory:":
+        return duckdb.connect(database=":memory:")
+    return duckdb.connect(database=target, read_only=read_only)
 
-def get_anchor_date(con) -> date: #What date should the application consider as the latest date in the dataset?
+
+def cursor(con: duckdb.DuckDBPyConnection):
     """
-    Trap #3 Solution:
-    Finds the maximum date in the transactions / vendor_payouts table.
-    All relative dates ('last month', 'this quarter', 'YTD') are anchored
-    to this date rather than datetime.now().
+    Short-lived cursor for one query.
+
+    BUGS.md B15: a single shared connection is not safe for concurrent use, and
+    the agent issues several tool calls per turn. Every query goes through its
+    own cursor.
     """
+    return con.cursor()
+
+
+def query_df(con: duckdb.DuckDBPyConnection, sql: str, params: list = None):
+    """Executes parameterised SQL on a dedicated cursor and returns a DataFrame."""
+    cur = con.cursor()
     try:
-        # Find the latest date from vendor payouts AND transactions, then choose whichever is later.
-        res = con.execute(f"""
-            SELECT MAX(p_date) FROM (
-                SELECT MAX({config.SCHEMA_CONFIG['vendor_payouts']['date_col']}) as p_date FROM {config.TABLE_PAYOUTS}
-                UNION ALL
-                SELECT MAX({config.SCHEMA_CONFIG['transactions']['date_col']}) as p_date FROM {config.TABLE_TRANSACTIONS}
+        return cur.execute(sql, params or []).df()
+    finally:
+        cur.close()
+
+
+# =============================================================
+# SOURCE LOADING
+# =============================================================
+
+def _find_source_file(data_dir: str, stem: str) -> Optional[str]:
+    """Locates <stem>.parquet or <stem>.csv in data_dir."""
+    for ext in ("parquet", "csv"):
+        hits = glob.glob(os.path.join(data_dir, f"{stem}.{ext}"))
+        if hits:
+            return hits[0].replace("\\", "/")
+    return None
+
+
+def load_from_files(con, data_dir: str = None) -> dict:
+    """
+    Loads bank / account / transaction from parquet or CSV into raw_* tables.
+
+    Returns {table_name: row_count}.
+    """
+    data_dir = data_dir or config.DATA_DIR
+    counts = {}
+    for table, meta in config.SCHEMA_CONFIG.items():
+        path = _find_source_file(data_dir, meta["file"])
+        if not path:
+            raise FileNotFoundError(
+                f"No source file for '{table}' in {data_dir} "
+                f"(looked for {meta['file']}.parquet / .csv). "
+                f"Run: python data_generator.py"
             )
-        """).fetchone()
+        reader = "read_parquet" if path.endswith(".parquet") else "read_csv_auto"
+        con.execute(f"CREATE OR REPLACE TABLE raw_{table} AS SELECT * FROM {reader}('{path}');")
+        counts[table] = con.execute(f"SELECT COUNT(*) FROM raw_{table}").fetchone()[0]
+    return counts
 
-        
-        if res and res[0]:
-            val = res[0]
-            if isinstance(val, str):
-                return datetime.strptime(val, "%Y-%m-%d").date()
-            elif isinstance(val, (datetime, date)):
-                return val if isinstance(val, date) else val.date() #if its date time just return date  else directly return it if its just date
-    except Exception as e:
-        print(f"Notice: Using fallback anchor date due to: {e}")
-    
-    # Fallback to current date if table is empty
-    return date.today()
 
-def calculate_relative_date_range(period: str, anchor_date: date):
+def load_from_mysql(con, dsn: dict = None, since: str = None) -> dict:
     """
-    Calculates exact start and end dates relative to anchor_date:
-    - 'last_month'
-    - 'this_month'
-    - 'two_months_ago'
-    - 'last_quarter'
-    - 'ytd'
+    Streams source tables from MySQL over TLS via DuckDB's mysql extension.
+
+    Nothing passes through Python memory. `since` (a date string) restricts the
+    transaction pull for incremental loads -- callers should already have
+    subtracted config.INGEST_LOOKBACK_DAYS from the watermark, because banking
+    systems post transactions late (plan §12.3).
     """
-    if not period or not anchor_date:
-        return None, None
-        
-    period = period.lower().strip()
-    
-    if period in ["last_month", "previous_month"]:
-        # First day of previous month to last day of previous month
-        first_of_this_month = anchor_date.replace(day=1) #anchor date is may 31 it will replace with may 1
-        last_of_prev_month = first_of_this_month - relativedelta(days=1) #last day of previous month
-        first_of_prev_month = last_of_prev_month.replace(day=1)
-        return first_of_prev_month.strftime("%Y-%m-%d"), last_of_prev_month.strftime("%Y-%m-%d") #so lat month 2024-04-01 → 2024-04-30
+    dsn = dsn or config.MYSQL_DSN
+    if not dsn.get("host"):
+        raise ValueError("MYSQL_HOST is not configured; use load_from_files() instead.")
+    if not dsn.get("ssl_ca"):
+        raise ValueError(
+            "Refusing to connect without MYSQL_SSL_CA. Encryption in transit is "
+            "required; set MYSQL_SSL_CA to the server CA bundle."
+        )
 
-    elif period in ["this_month", "current_month"]:
-        first_of_this_month = anchor_date.replace(day=1)
-        return first_of_this_month.strftime("%Y-%m-%d"), anchor_date.strftime("%Y-%m-%d")
+    con.execute("INSTALL mysql; LOAD mysql;")
+    attach = (
+        f"host={dsn['host']} port={dsn['port']} user={dsn['user']} "
+        f"password={dsn['password']} database={dsn['database']} "
+        f"ssl_mode=VERIFY_IDENTITY ssl_ca={dsn['ssl_ca']}"
+    )
+    con.execute(f"ATTACH '{attach}' AS src (TYPE mysql, READ_ONLY);")
 
-    elif period in ["two_months_ago", "month_before_last"]:
-        first_of_this_month = anchor_date.replace(day=1)
-        prev_1 = first_of_this_month - relativedelta(months=1) #last month
-        prev_2_start = (prev_1 - relativedelta(months=1)).replace(day=1) #two months ago start date
-        prev_2_end = prev_1 - relativedelta(days=1) #two months ago end date
-        return prev_2_start.strftime("%Y-%m-%d"), prev_2_end.strftime("%Y-%m-%d")
+    date_col = config.SCHEMA_CONFIG["transaction"]["date_col"]
+    counts = {}
+    for table in ("bank", "account", "transaction"):
+        # account.available_balance is a mutable snapshot, not an append-only
+        # fact, so account and bank are always fully refreshed (plan §12.3).
+        if table == "transaction" and since:
+            sql = (f"CREATE OR REPLACE TABLE raw_transaction AS "
+                   f"SELECT * FROM src.transaction WHERE {date_col} >= ?;")
+            con.execute(sql, [since])
+        else:
+            con.execute(f"CREATE OR REPLACE TABLE raw_{table} AS SELECT * FROM src.{table};")
+        counts[table] = con.execute(f"SELECT COUNT(*) FROM raw_{table}").fetchone()[0]
 
-    elif period in ["ytd", "year_to_date"]:
-        ytd_start = date(anchor_date.year, 1, 1)
-        return ytd_start.strftime("%Y-%m-%d"), anchor_date.strftime("%Y-%m-%d")
+    con.execute("DETACH src;")
+    return counts
 
-    elif period in ["last_quarter", "q1", "q2", "q3", "q4"]:
-        # Standard quarter mapping
-        current_quarter = (anchor_date.month - 1) // 3 + 1 #for may month =5 Because we want the months to be grouped neatly into blocks of 3 starting from zero: (5 - 1) // 3 + 1 i.e  4 // 3 + 1 i.e 1 + 1 = 2 so current quarter is 2
-        target_q = current_quarter - 1 if period == "last_quarter" else int(period.replace("q", "")) #if q3 goes to q4 if asks last quarter gives 4 by replacing q with empty
-        target_year = anchor_date.year if target_q >= 1 else anchor_date.year - 1 #Handle previous year's Q4 #is trgaet quarter is less than 1 then it means we are in q1 and last quarter is q4 of previous year so target year = anchor date year -1
-        target_q = 4 if target_q < 1 else target_q 
-        
-        q_start_month = (target_q - 1) * 3 + 1 #gives quarteer starter months like for q1 jan and for q2 april and for q3 july and for q4 october
-        q_start = date(target_year, q_start_month, 1)
-        q_end = (q_start + relativedelta(months=3)) - relativedelta(days=1) #Q1 = January 1 → March 31 from start date add 3 months  and after adding 3 months subtract 1 day so it will be that quarter 
-        return q_start.strftime("%Y-%m-%d"), q_end.strftime("%Y-%m-%d")
-        
-    return None, None
 
-def get_all_vendor_names(con) -> list:
-    """Returns list of canonical vendor names from DB."""
+# =============================================================
+# ANCHOR DATE
+# =============================================================
+
+def get_anchor_date(con, table: str = None) -> date:
+    """
+    The dataset's notion of 'today' = MAX(transaction_date).
+
+    Relative periods must anchor here, never to the wall clock: the sample data
+    runs to 2026-06, and anchoring to datetime.now() would make 'last month'
+    resolve to a window containing no rows.
+    """
+    table = table or config.TABLE_TXN_FACT
+    date_col = config.SCHEMA_CONFIG["transaction"]["date_col"]
     try:
-        df = con.execute(f"SELECT {config.SCHEMA_CONFIG['vendors']['name_col']} FROM {config.TABLE_VENDORS}").df()
-        return df[config.SCHEMA_CONFIG['vendors']['name_col']].dropna().tolist()
+        val = con.execute(f"SELECT MAX({date_col}) FROM {table}").fetchone()[0]
     except Exception:
-        return []
+        try:
+            val = con.execute(f"SELECT MAX({date_col}) FROM raw_transaction").fetchone()[0]
+        except Exception:
+            return date.today()
+    if val is None:
+        return date.today()
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    return datetime.strptime(str(val)[:10], "%Y-%m-%d").date()
 
-# db.py And it has 4 main responsibilities:
 
-# Create the DuckDB database.
-# Load all CSV files into DuckDB.
-# Find the dataset's anchor date.
-# Convert phrases like "last month" / "YTD" / "last quarter" into exact dates.
-# Give the system the list of valid vendor names.
+# =============================================================
+# TIME RANGE RESOLUTION  (BUGS.md B01)
+# =============================================================
+
+RESOLVED = "RESOLVED"      # a concrete window
+ALL_TIME = "ALL_TIME"      # no period requested -- querying all history is correct
+UNRESOLVED = "UNRESOLVED"  # a period WAS requested but could not be parsed
 
 
+@dataclass
+class TimeRange:
+    status: str
+    start: Optional[str] = None
+    end: Optional[str] = None
+    label: str = ""
+    canonical: Optional[str] = None
+    suggestions: list = field(default_factory=list)
+
+    @property
+    def month_aligned(self) -> bool:
+        """
+        True when this window can be answered from the monthly rollup.
+
+        Requires start on the 1st and end on a month end. An end at or beyond
+        the anchor also counts: no data exists past the anchor, so extending to
+        the month end is provably result-identical (plan §12.5).
+        """
+        if self.status != RESOLVED or not self.start or not self.end:
+            return self.status == ALL_TIME
+        s = datetime.strptime(self.start, "%Y-%m-%d").date()
+        e = datetime.strptime(self.end, "%Y-%m-%d").date()
+        last_of_end_month = (e.replace(day=1) + relativedelta(months=1)) - relativedelta(days=1)
+        return s.day == 1 and e == last_of_end_month
 
 
-# BLOCK 12 — get_anchor_date()
+# Canonical vocabulary. Aliases exist because the LLM is *prompted* with an enum
+# but not *constrained* to it -- response_format=json_object guarantees syntax,
+# not schema. Unknown values must land on UNRESOLVED, never on "no filter".
+_PERIOD_ALIASES = {
+    "all": "all_time", "all_time": "all_time", "total": "all_time",
+    "lifetime": "all_time", "ever": "all_time", "overall": "all_time",
+    "any": "all_time", "everything": "all_time", "none": "all_time",
 
-# Now we reach one of the most important functions in your entire project.
+    "this_month": "this_month", "current_month": "this_month",
+    "mtd": "this_month", "month_to_date": "this_month",
 
-# def get_anchor_date(con) -> date:
+    "last_month": "last_month", "previous_month": "last_month",
+    "prev_month": "last_month", "past_month": "last_month",
+    "prior_month": "last_month", "the_last_month": "last_month",
 
-# This function answers:
+    "two_months_ago": "two_months_ago", "month_before_last": "two_months_ago",
+    "month_before": "two_months_ago",
 
-# "What date should the application consider as the latest date in the dataset?"
+    "this_quarter": "this_quarter", "current_quarter": "this_quarter",
+    "qtd": "this_quarter", "quarter_to_date": "this_quarter",
 
-# Why does the application need this?
+    "last_quarter": "last_quarter", "previous_quarter": "last_quarter",
+    "past_quarter": "last_quarter", "prior_quarter": "last_quarter",
 
-# Because your data is historical.
+    "q1": "q1", "q2": "q2", "q3": "q3", "q4": "q4",
 
-# Your dataset might end on:
+    "ytd": "ytd", "year_to_date": "ytd", "this_year": "ytd",
+    "current_year": "ytd",
 
-# 2024-05-31
+    "last_year": "last_year", "previous_year": "last_year",
+    "past_year": "last_year", "prior_year": "last_year",
+}
 
-# But your computer's real date could be:
+_MONTH_NAMES = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
 
-# 2026-09-04
+_SUGGESTIONS = ["last_month", "last_3_months", "this_month", "ytd", "all_time"]
 
-# If the application used:
 
-# date.today()
+def _norm_period(period: str) -> str:
+    """Folds 'Last Month', 'last-month', 'lastMonth', ' LAST_MONTH ' onto one form."""
+    s = str(period).strip()
+    # camelCase -> snake_case, so an LLM emitting 'lastMonth' still resolves.
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", s)
+    s = s.lower()
+    s = re.sub(r"[\s\-]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
 
-# for everything, then:
 
-# "last month"
+def _month_bounds(y: int, m: int):
+    start = date(y, m, 1)
+    end = (start + relativedelta(months=1)) - relativedelta(days=1)
+    return start, end
 
-# would mean August 2026.
 
-# But there may be no August 2026 data.
+def resolve_time_range(period, anchor_date: date) -> TimeRange:
+    """
+    Resolves a period expression against the dataset anchor date.
 
-# Therefore your application finds the latest date actually present in the dataset.
+    Returns a TimeRange whose status is one of:
+        ALL_TIME   - no period requested; querying all history is correct
+        RESOLVED   - concrete start/end
+        UNRESOLVED - a period was requested but not understood; the caller MUST
+                     ask the user rather than answering (BUGS.md B01)
+    """
+    if period is None or (isinstance(period, str) and not period.strip()):
+        return TimeRange(status=ALL_TIME, label="all time", canonical="all_time")
 
-# That becomes the anchor date.
+    p = _norm_period(period)
+    canonical = _PERIOD_ALIASES.get(p)
+
+    # last_n_months / past_3_months / trailing_6_months
+    if canonical is None:
+        m = re.match(r"^(?:last|past|previous|prior|trailing)_(\d{1,2})_months?$", p)
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= 60:
+                start = (anchor_date.replace(day=1) - relativedelta(months=n - 1))
+                _, end = _month_bounds(anchor_date.year, anchor_date.month)
+                return TimeRange(
+                    status=RESOLVED,
+                    start=start.strftime("%Y-%m-%d"),
+                    end=end.strftime("%Y-%m-%d"),
+                    label=f"last {n} calendar months ({start:%b %Y} - {anchor_date:%b %Y})",
+                    canonical=f"last_{n}_months",
+                )
+            return TimeRange(status=UNRESOLVED, label=str(period), suggestions=_SUGGESTIONS)
+
+    # last_n_days / last_30_days -- deliberately NOT month-aligned
+    if canonical is None:
+        m = re.match(r"^(?:last|past|previous|prior|trailing)_(\d{1,4})_days?$", p)
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= 3650:
+                start = anchor_date - relativedelta(days=n - 1)
+                return TimeRange(
+                    status=RESOLVED,
+                    start=start.strftime("%Y-%m-%d"),
+                    end=anchor_date.strftime("%Y-%m-%d"),
+                    label=f"last {n} days ({start} to {anchor_date})",
+                    canonical=f"last_{n}_days",
+                )
+            return TimeRange(status=UNRESOLVED, label=str(period), suggestions=_SUGGESTIONS)
+
+    # bare month name, optionally with a year: "april", "april_2026"
+    if canonical is None:
+        m = re.match(r"^([a-z]+)(?:_(\d{4}))?$", p)
+        if m and m.group(1) in _MONTH_NAMES:
+            mon = _MONTH_NAMES[m.group(1)]
+            yr = int(m.group(2)) if m.group(2) else anchor_date.year
+            start, end = _month_bounds(yr, mon)
+            return TimeRange(
+                status=RESOLVED,
+                start=start.strftime("%Y-%m-%d"),
+                end=end.strftime("%Y-%m-%d"),
+                label=f"{start:%B %Y}",
+                canonical=f"{m.group(1)}_{yr}",
+            )
+
+    if canonical is None:
+        return TimeRange(status=UNRESOLVED, label=str(period), suggestions=_SUGGESTIONS)
+
+    if canonical == "all_time":
+        return TimeRange(status=ALL_TIME, label="all time", canonical="all_time")
+
+    if canonical == "this_month":
+        start, end = _month_bounds(anchor_date.year, anchor_date.month)
+        return TimeRange(RESOLVED, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
+                         f"{start:%B %Y}", canonical)
+
+    if canonical == "last_month":
+        ref = anchor_date.replace(day=1) - relativedelta(months=1)
+        start, end = _month_bounds(ref.year, ref.month)
+        return TimeRange(RESOLVED, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
+                         f"{start:%B %Y}", canonical)
+
+    if canonical == "two_months_ago":
+        ref = anchor_date.replace(day=1) - relativedelta(months=2)
+        start, end = _month_bounds(ref.year, ref.month)
+        return TimeRange(RESOLVED, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
+                         f"{start:%B %Y}", canonical)
+
+    if canonical in ("this_quarter", "last_quarter", "q1", "q2", "q3", "q4"):
+        cur_q = (anchor_date.month - 1) // 3 + 1
+        year = anchor_date.year
+        if canonical == "this_quarter":
+            q = cur_q
+        elif canonical == "last_quarter":
+            q = cur_q - 1
+            if q < 1:
+                q, year = 4, year - 1
+        else:
+            q = int(canonical[1])
+        start = date(year, (q - 1) * 3 + 1, 1)
+        end = (start + relativedelta(months=3)) - relativedelta(days=1)
+        return TimeRange(RESOLVED, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
+                         f"Q{q} {year}", canonical)
+
+    if canonical == "ytd":
+        start = date(anchor_date.year, 1, 1)
+        _, end = _month_bounds(anchor_date.year, anchor_date.month)
+        return TimeRange(RESOLVED, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
+                         f"{anchor_date.year} year to date", canonical)
+
+    if canonical == "last_year":
+        y = anchor_date.year - 1
+        return TimeRange(RESOLVED, f"{y}-01-01", f"{y}-12-31", str(y), canonical)
+
+    return TimeRange(status=UNRESOLVED, label=str(period), suggestions=_SUGGESTIONS)
+
+
+def parse_absolute_range(start: str, end: str, anchor_date: date = None) -> TimeRange:
+    """
+    Validates an explicit start/end pair (BUGS.md B11).
+
+    V1 bound LLM-supplied dates straight into SQL: malformed values raised a raw
+    DuckDB ConversionException that surfaced to the user, and inverted or
+    wrong-year ranges silently returned zero rows.
+    """
+    try:
+        s = datetime.strptime(str(start)[:10], "%Y-%m-%d").date()
+        e = datetime.strptime(str(end)[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return TimeRange(status=UNRESOLVED, label=f"{start} to {end}",
+                         suggestions=["YYYY-MM-DD"])
+    if s > e:
+        s, e = e, s
+    return TimeRange(RESOLVED, s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d"),
+                     f"{s} to {e}", "absolute")
+
+
+# =============================================================
+# MANIFEST
+# =============================================================
+
+def schema_fingerprint() -> str:
+    """Detects schema drift between ingests."""
+    blob = repr(sorted((t, tuple(sorted(m.items()))) for t, m in config.SCHEMA_CONFIG.items()))
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def read_manifest(con) -> Optional[dict]:
+    try:
+        rows = con.execute(f"SELECT * FROM {config.TABLE_MANIFEST} LIMIT 1").df()
+    except Exception:
+        return None
+    return None if rows.empty else rows.iloc[0].to_dict()
+
+
+def write_manifest(con, watermark, row_count: int):
+    con.execute(f"""
+        CREATE OR REPLACE TABLE {config.TABLE_MANIFEST} (
+            watermark TIMESTAMP, row_count BIGINT,
+            schema_hash VARCHAR, alias_map_version INTEGER, built_at TIMESTAMP
+        );
+    """)
+    con.execute(
+        f"INSERT INTO {config.TABLE_MANIFEST} VALUES (?, ?, ?, ?, now());",
+        [watermark, row_count, schema_fingerprint(), config.ALIAS_MAP_VERSION],
+    )

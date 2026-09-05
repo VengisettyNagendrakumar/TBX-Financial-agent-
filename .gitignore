@@ -4,3 +4,9 @@ __pycache__/
 .system_generated/
 myenv/
 
+
+# V2 warehouse artefacts
+*.duckdb
+*.duckdb.wal
+data/*.parquet
+data/*.csv
