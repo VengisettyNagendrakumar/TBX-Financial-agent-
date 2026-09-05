@@ -449,7 +449,7 @@ class FinanceAgent:
 
         # Checked before the generic "show me …" branch, which would otherwise
         # swallow "show me all my accounts" as a transaction listing.
-        if re.search(r"\b(balances?|how much do i have|in my account)\b"
+        if re.search(r"\b(balances?|how much do i have|in my account|savings|current|checking)\b"
                      r"|\b(?:all\s+)?(?:my\s+)?accounts?\b", low):
             return "get_balances", {}
 
@@ -827,5 +827,7 @@ class FinanceAgent:
                 # A specific counterparty turns a ranking into a single total.
                 if tool == "rank_counterparties":
                     tool = "get_spend"
+        elif slot == "account":
+            args["account"] = message.strip()
         args.setdefault("direction", config.TXN_DEBIT)
         return tool, args
