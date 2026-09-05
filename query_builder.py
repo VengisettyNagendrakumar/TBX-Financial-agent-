@@ -105,7 +105,24 @@ def build_sql(intent: dict, resolved_vendor: str, anchor_date) -> dict:
     t_id = config.SCHEMA_CONFIG['transactions']['id_col']
     r_tid = config.SCHEMA_CONFIG['reconciliation_status']['txn_id_col']
 
-    if intent_type == "spend_summary":
+    if intent_type == "latest_payment":
+        active_params = payout_params
+        limit_val = intent.get("limit") or 1
+        sql = f"""
+        SELECT 
+            p.{config.SCHEMA_CONFIG['vendor_payouts']['date_col']} AS payout_date,
+            v.{v_name} AS vendor_name,
+            p.{config.SCHEMA_CONFIG['vendor_payouts']['amount_col']} AS amount,
+            p.{config.SCHEMA_CONFIG['vendor_payouts']['status_col']} AS status,
+            p.{config.SCHEMA_CONFIG['vendor_payouts']['desc_col']} AS description
+        FROM {p_table} p
+        JOIN {v_table} v ON p.{p_vid} = v.{v_id}
+        WHERE {where_payouts}
+        ORDER BY p.{config.SCHEMA_CONFIG['vendor_payouts']['date_col']} DESC
+        LIMIT {limit_val}
+        """
+
+    elif intent_type == "spend_summary":
         active_params = payout_params
         if resolved_vendor:
             sql = f"""
@@ -170,6 +187,7 @@ def build_sql(intent: dict, resolved_vendor: str, anchor_date) -> dict:
 
     else:  # transaction_list / default details
         active_params = payout_params
+        limit_val = intent.get("limit") or 50
         sql = f"""
         SELECT 
             p.{config.SCHEMA_CONFIG['vendor_payouts']['date_col']} AS payout_date,
@@ -181,7 +199,7 @@ def build_sql(intent: dict, resolved_vendor: str, anchor_date) -> dict:
         JOIN {v_table} v ON p.{p_vid} = v.{v_id}
         WHERE {where_payouts}
         ORDER BY p.{config.SCHEMA_CONFIG['vendor_payouts']['date_col']} DESC
-        LIMIT 50
+        LIMIT {limit_val}
         """
 
     cleaned_sql = sql.strip()

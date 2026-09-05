@@ -45,9 +45,10 @@ Detected Statistical Anomalies:
 Formatting & Content Rules:
 1. Explain the numbers clearly and professionally in 2-3 sentences.
 2. DO NOT recalculate, aggregate, or guess any figures. Reference ONLY the exact numbers in the table.
-3. If anomalies are listed above, mention the anomaly spike as a notable observation.
-4. If the anomaly section says 'None', DO NOT mention anomalies or say 'no anomalies detected'.
-5. Write clear plain markdown. Do not wrap currency amounts in LaTeX math syntax.
+3. If the user asked for the latest, most recent, or single payment, directly state the specific payout date, vendor name, amount ($X.XX), status, and description of that exact payment. DO NOT talk about total spend or average payouts.
+4. If anomalies are listed above, mention the anomaly spike as a notable observation.
+5. If the anomaly section says 'None', DO NOT mention anomalies or say 'no anomalies detected'.
+6. Write clear plain markdown. Do not wrap currency amounts in LaTeX math syntax.
 """
             client = Groq(api_key=groq_key)
             resp = client.chat.completions.create(
@@ -63,7 +64,20 @@ Formatting & Content Rules:
     # Fallback explanation if API call fails
     q_type = query_info.get("query_type")
     
-    if q_type == "spend_summary":
+    if q_type == "latest_payment":
+        if not df.empty:
+            row = df.iloc[0]
+            v_name = row.get("vendor_name", "the vendor")
+            p_date = row.get("payout_date", "")
+            amt = float(row.get("amount", 0.0))
+            status = row.get("status", "Completed")
+            desc = row.get("description", "")
+            desc_str = f" for '{desc}'" if desc else ""
+            return f"The latest payment to **{v_name}** was **${amt:,.2f}** on **{p_date}** (Status: **{status}**){desc_str}."
+        else:
+            return "No payout records found matching your query."
+
+    elif q_type == "spend_summary":
         if "total_spend" in df.columns:
             if len(df) == 1:
                 row = df.iloc[0]

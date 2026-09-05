@@ -17,13 +17,13 @@ LEGAL_SUFFIXES = {"inc", "corp", "corporation", "ltd", "llc", "co", "company", "
 
 def get_candidate_acronyms(vendor_name: str) -> list[str]:
     """Generates candidate acronyms for any vendor name (e.g. 'Amazon Web Services, Inc.' -> ['aws', 'awsi'])."""
-    cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', vendor_name).lower()
+    cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', vendor_name).lower() #if the letters or not alphabets and numbers replace with space
     all_words = cleaned.split()
     filtered_words = [w for w in all_words if w not in LEGAL_SUFFIXES]
     
-    candidates = []
+    candidates = [] #suppose we have filtered words=[amazon,web,services]
     if len(filtered_words) >= 2:
-        candidates.append("".join(w[0] for w in filtered_words))
+        candidates.append("".join(w[0] for w in filtered_words)) #the first letter of evry word like it will becoem aws 
     if len(all_words) >= 2:
         full_acr = "".join(w[0] for w in all_words)
         if full_acr not in candidates:
@@ -60,9 +60,9 @@ def resolve_vendor(user_input_vendor: str, known_vendors: list):
         acrs = get_candidate_acronyms(v)
         if query in acrs:
             acronym_matches.append(v)
-    if len(acronym_matches) == 1:
+    if len(acronym_matches) == 1: #if only one acronym matches like suppose only one aws it is matched
         return "MATCH", acronym_matches[0], 0.98
-    elif len(acronym_matches) > 1:
+    elif len(acronym_matches) > 1: #suppose used asked amazon so it will match amazon web services and amazon logistics so it will be ambiguous
         return "AMBIGUOUS", acronym_matches, 0.90
 
     # 4. Direct Substring / Word-containment matching (handles "Amazon", "CloudScale", etc.)
@@ -83,7 +83,7 @@ def resolve_vendor(user_input_vendor: str, known_vendors: list):
     # 5. Fuzzy Scoring via WRatio
     scores = []
     for v in known_vendors:
-        score = fuzz.WRatio(query, v)
+        score = fuzz.WRatio(query, v) #calcuate similarity score between query and vendor name
         scores.append((v, score))
         
     scores.sort(key=lambda x: x[1], reverse=True)

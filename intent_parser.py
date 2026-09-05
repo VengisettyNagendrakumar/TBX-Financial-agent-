@@ -30,8 +30,9 @@ For example:
 
 JSON Schema:
 {{
-  "intent": "spend_summary" | "transaction_list" | "reconciliation_audit" | "category_summary",
+  "intent": "spend_summary" | "transaction_list" | "latest_payment" | "reconciliation_audit" | "category_summary",
   "vendor_raw": "<extracted vendor name or null>",
+  "limit": 1 | null,
   "date_filter": {{
     "type": "relative" | "absolute" | "all",
     "relative_value": "last_month" | "this_month" | "two_months_ago" | "last_quarter" | "ytd" | null,
@@ -45,12 +46,13 @@ JSON Schema:
 
 Rules:
 1. If the user asks about spend grouped by category or department ("by category", "category spend", "show spend by category"), intent MUST be "category_summary".
-2. If the user asks about overall spend/cost/total paid ("how much did we spend", "total paid to X"), intent is "spend_summary".
-3. If the user asks for a list of transactions or payouts ("show me transactions", "list payouts"), intent is "transaction_list".
-4. If the user asks about reconciliation, unreconciled items, status audits ("which transactions are unreconciled"), intent is "reconciliation_audit".
-5. If the user asks about spend or payouts for a specific company or entity (e.g. "O'Brien Consulting", "Netflix", "Acme"), you MUST extract that exact name into "vendor_raw". NEVER set "vendor_raw" to null when a specific entity name is mentioned!
-6. If the user asks a follow-up ("what about the month before", "how about in May"), retain the previous vendor from conversation history and mark is_followup: true.
-7. Return ONLY valid JSON.
+2. If the user asks for the latest, most recent, or last single payment/payout ("latest payment", "latest single payment", "most recent payout", "last payment to X", "how much was the latest payment to X"), intent MUST be "latest_payment" and limit MUST be 1.
+3. If the user asks about overall spend/cost/total paid over a time period ("how much did we spend in May", "total spend on AWS", "total paid to X"), intent is "spend_summary".
+4. If the user asks for a list or history of multiple transactions/payouts ("show me transactions", "list payouts", "show all payouts"), intent is "transaction_list".
+5. If the user asks about reconciliation, unreconciled items, status audits ("which transactions are unreconciled"), intent is "reconciliation_audit".
+6. If the user asks about spend or payouts for a specific company or entity (e.g. "O'Brien Consulting", "Netflix", "Acme", "Salesforce"), you MUST extract that exact name into "vendor_raw". NEVER set "vendor_raw" to null when a specific entity name is mentioned!
+7. If the user asks a follow-up ("what about the month before", "how about in May"), retain the previous vendor from conversation history and mark is_followup: true.
+8. Return ONLY valid JSON.
 """
 
 def parse_intent_llm(user_query: str, chat_history: list = [], anchor_date=None, known_vendors: list = None):
@@ -63,7 +65,7 @@ def parse_intent_llm(user_query: str, chat_history: list = [], anchor_date=None,
             messages = [{"role": "system", "content": prompt}]
             for msg in chat_history[-4:]:
                 messages.append({"role": msg["role"], "content": msg["content"]})
-            messages.append({"role": "user", "content": user_query})
+            messages.append({"role": "user", "content": user_query}) #add current question
             
             resp = client.chat.completions.create(
                 model=config.ACTIVE_MODEL,
@@ -89,7 +91,11 @@ def parse_intent_fallback(user_query: str, chat_history: list = [], anchor_date=
     
     # 1. Determine Intent
     intent = "spend_summary"
-    if any(k in q for k in ["unreconciled", "reconciliation", "reconcile", "pending", "disputed"]):
+    limit = None
+    if any(k in q for k in ["latest payment", "latest single payment", "most recent payment", "most recent payout", "last payment", "last payout", "single payment"]):
+        intent = "latest_payment"
+        limit = 1
+    elif any(k in q for k in ["unreconciled", "reconciliation", "reconcile", "pending", "disputed"]):
         intent = "reconciliation_audit"
     elif any(k in q for k in ["category", "categories", "by department", "by category"]):
         intent = "category_summary"
@@ -119,7 +125,7 @@ def parse_intent_fallback(user_query: str, chat_history: list = [], anchor_date=
     elif any(k in q for k in ["two months ago", "month before last", "month before"]):
         date_filter = {"type": "relative", "relative_value": "two_months_ago"}
     elif any(k in q for k in ["last quarter", "q1", "q2", "q3", "q4"]):
-        match = re.search(r"\bq[1-4]\b", q)
+        match = re.search(r"\bq[1-4]\b", q) #/b means word boundary q[1-4] means q followed by one digit between 1 and 4
         q_val = match.group(0) if match else "last_quarter"
         date_filter = {"type": "relative", "relative_value": q_val}
     elif any(k in q for k in ["ytd", "year to date", "this year"]):
@@ -135,7 +141,7 @@ def parse_intent_fallback(user_query: str, chat_history: list = [], anchor_date=
         }
         for m_name, m_num in month_map.items():
             if re.search(rf"\b{m_name}\b", q):
-                last_day = calendar.monthrange(ref_year, m_num)[1]
+                last_day = calendar.monthrange(ref_year, m_num)[1] #[1] gets the last day of the month i.e no of days 
                 date_filter = {
                     "type": "absolute",
                     "start_date": f"{ref_year}-{m_num:02d}-01",
@@ -154,8 +160,8 @@ def parse_intent_fallback(user_query: str, chat_history: list = [], anchor_date=
             if clean_kv in q:
                 vendor_raw = kv
                 break
-            # Distinctive word check (e.g. "CloudScale", "Deloitte")
-            distinctive_words = [w for w in clean_kv.split() if len(w) > 4 and w not in ["technologies", "corporation", "platform", "services", "global", "limited", "company"]]
+            # Distinctive word check (e.g. "CloudScale", "Deloitte" )
+            distinctive_words = [w for w in clean_kv.split() if len(w) > 4 and w not in ["technologies", "corporation", "platform", "services", "global", "limited", "company"]] #it will split amazon web services into [amzon,web,services] and it will filter out words which are less than 4 letters and also filter out common words like technologies, corporation, platform, services, global, limited, company we are removing these beacuse we like if someone like what services spend it may give wrong ans by hallucunating so thats why
             for dw in distinctive_words:
                 if re.search(rf"\b{dw}\b", q):
                     vendor_raw = kv
@@ -195,6 +201,7 @@ def parse_intent_fallback(user_query: str, chat_history: list = [], anchor_date=
     return {
         "intent": intent,
         "vendor_raw": vendor_raw,
+        "limit": limit,
         "date_filter": date_filter,
         "reconciliation_status": recon_status,
         "category": None,
