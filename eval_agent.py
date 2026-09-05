@@ -114,6 +114,53 @@ CASES = [
      "compare my spending to the 3 months before",
      {"merchant": "SWIGGY", "period_token": "last_3_months", "direction": "debit"},
      lambda r: r.status != agent_mod.GUARDRAIL),
+
+    # --- the long tail reported from live testing -------------------------
+    (16, "Threshold: transactions over one lakh",
+     "which transaction is more than one lakh", None,
+     lambda r: r.status == agent_mod.ANSWER and r.kind == "list"
+               and (r.result.facts.get("min_amount") == 100000
+                    or r.result.filters.get("via") == "generated_sql")),
+
+    (17, "Single highest transaction (not a vendor ranking)",
+     "what was the highest amount I have done in a transaction", None,
+     lambda r: r.status == agent_mod.ANSWER and r.kind in ("list", "sql")
+               and len(r.result.rows) == 1),
+
+    (18, "Latest transaction: no period question, both directions",
+     "what is my latest transaction", None,
+     lambda r: r.status == agent_mod.ANSWER and r.kind in ("list", "sql")
+               and f(r, "direction") is None),
+
+    (19, "Last N with a merchant: no period question",
+     "last 5 transactions in bookmyshow", None,
+     lambda r: r.status == agent_mod.ANSWER and f(r, "merchant") == "BOOKMYSHOW"
+               and len(r.result.rows) == 5),
+
+    (20, "Which month was highest (monthly breakdown)",
+     "on which month I have high expense", None,
+     lambda r: r.status == agent_mod.ANSWER
+               and (r.result.facts.get("top_month") is not None
+                    or r.result.filters.get("via") == "generated_sql")),
+
+    (21, "Other account details -> balances, all accounts",
+     "show me my other account details", None,
+     lambda r: r.status == agent_mod.ANSWER and len(r.result.rows) > 1),
+
+    (22, "Long tail only SQL can express (LLM) / honest note (rules)",
+     "how many transactions did I make on weekends", None,
+     lambda r: r.status == agent_mod.ANSWER and (
+         r.result.filters.get("via") == "generated_sql"
+         or any("need the language model" in n for n in r.result.notes))),
+
+    (23, "First transaction in a calendar year",
+     "Show me the first transaction in the year 2026", None,
+     lambda r: r.status == agent_mod.ANSWER and f(r, "start") == "2026-01-01"
+               and len(r.result.rows) == 1),
+
+    (24, "Unknown vendor never becomes 'you spent nothing' via SQL",
+     "What did I spend on Oracle?", None,
+     lambda r: r.status == agent_mod.GUARDRAIL and "oracle" in r.answer.lower()),
 ]
 
 
@@ -186,11 +233,14 @@ def main():
             print("\nSkipping LLM planner: no LLM_API_KEY / GROQ_API_KEY.")
             continue
         if planner == "rules":
-            os.environ["LLM_API_KEY"] = ""
-            os.environ["GROQ_API_KEY"] = ""
+            # Every key llm.api_key() can fall back to, or the "rules" row is
+            # silently an LLM run -- which the clean? column then reports.
+            for k in ("LLM_API_KEY", "GROQ_API_KEY", "OPENAI_API_KEY"):
+                os.environ[k] = ""
             config.LLM_API_KEY = ""
             config.GROQ_API_KEY = ""
             llm.reset()
+            assert not llm.is_configured(), "rules run still sees an API key"
 
         label = (f"LLM ({llm.describe()})" if planner == "llm"
                  else "rules only (no API key)")

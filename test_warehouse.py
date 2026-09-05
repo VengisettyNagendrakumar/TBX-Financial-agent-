@@ -970,6 +970,171 @@ def test_agent(con):
               (not ok2) and offending, f"offending={offending}")
 
 
+def test_long_tail(con):
+    """
+    The failures reported from live testing, and the guarantees added to fix
+    them. Each assertion names the defect it prevents from returning.
+    """
+    print("\n--- Long tail: SQL fallback, bounded listings, checkpoint safety ---")
+    import importlib, tempfile
+    import agent as A
+    import chatstore as CS
+    import queries
+    import sqlguard as G
+    import explainer as X
+    import session as session_mod
+
+    sess = session_mod.load(con)
+    ent = sess.entity_id
+
+    # ---- checkpoints never pickle, even across a module reload ----------
+    # Streamlit hot-reloaded queries.py and every turn died with "Can't pickle
+    # QueryResult: it's not the same object as queries.QueryResult". Rich
+    # objects now live in agent._scratch; state is plain JSON.
+    tmp = os.path.join(tempfile.mkdtemp(), "chats_ll.db")
+    cstore = CS.ChatStore(tmp)
+    bot = A.FinanceAgent(con, session=sess, checkpointer=cstore.checkpointer())
+    tid = cstore.new_thread(ent, "ll")
+    r0 = bot.run("What are my various accounts? Show me all their details",
+                 thread_id=tid, turn=0)
+    importlib.reload(queries)
+    r1 = bot.run("What are my last 5 transactions with Book My Show",
+                 thread_id=tid, turn=1)
+    r2 = bot.run("Show me the first transaction in the year 2026",
+                 thread_id=tid, turn=2)
+    check("turns survive a reload of queries.py (no pickle of QueryResult)",
+          all(r.status != A.ERROR for r in (r0, r1, r2)),
+          f"{r0.status} {r1.status} {r2.status}: {r1.answer[:70]}")
+    types = dict(cstore.con.execute(
+        "SELECT type, COUNT(*) FROM checkpoints WHERE thread_id LIKE ? GROUP BY type",
+        (f"{tid}#%",)).fetchall())
+    check("every checkpoint is msgpack; none is pickle-typed",
+          types and all("pickle" not in str(t).lower() for t in types), f"{types}")
+    check("scratch slot is freed after each turn", not bot._scratch, f"{list(bot._scratch)}")
+    cstore.close()
+
+    # ---- sqlguard: the sandbox --------------------------------------------
+    ok_sql = "SELECT merchant, transaction_amount FROM my_transactions WHERE transaction_amount > ? ORDER BY 2 DESC"
+    check("sandbox runs a valid parameterised SELECT",
+          G.run(con, ent, ok_sql, [100000]).source == "generated_sql")
+    for label, bad, params in [
+            ("another table", "SELECT * FROM txn_fact LIMIT 3", []),
+            ("a table function", "SELECT * FROM read_parquet('x.parquet')", []),
+            ("DML", "DELETE FROM my_transactions", []),
+            ("two statements", "SELECT 1; SELECT 2", []),
+            ("param/placeholder mismatch", "SELECT * FROM my_transactions WHERE merchant = ?", []),
+            ("a sensitive column", "SELECT utr_number FROM my_transactions LIMIT 1", [])]:
+        try:
+            G.run(con, ent, bad, params)
+            check(f"sandbox refuses {label}", False, "ran without error")
+        except G.SQLRejected:
+            check(f"sandbox refuses {label}", True)
+    n_view = int(G.run(con, ent, "SELECT COUNT(*) AS n FROM my_transactions", []).rows.iloc[0]["n"])
+    n_fact = con.execute(f"SELECT COUNT(*) FROM {config.TABLE_TXN_FACT} WHERE entity_id = ?",
+                         [ent]).fetchone()[0]
+    check("sandbox view is scoped to exactly this customer's rows", n_view == n_fact,
+          f"{n_view} vs {n_fact}")
+
+    # ---- counterparty guard: SQL cannot bypass entity resolution --------
+    bot = A.FinanceAgent(con, session=sess)
+    q = "SELECT SUM(transaction_amount) FROM my_transactions WHERE merchant = ? LIMIT 1"
+    _, _, st, _, name = bot._sql_counterparty_guard("x", q, ["ORACLE"])
+    check("unknown name in a SQL param is NOT_FOUND, not an empty result", st == "NOT_FOUND")
+    _, _, st, _, _ = bot._sql_counterparty_guard(
+        "x", "SELECT 1 FROM my_transactions WHERE merchant = 'ORACLE' LIMIT 1", [])
+    check("unknown name inlined as a literal is caught too", st == "NOT_FOUND")
+    _, p2, st, _, _ = bot._sql_counterparty_guard("x", q, ["swiggy"])
+    check("known name is substituted with its canonical", st is None and p2 == ["SWIGGY"], f"{p2}")
+    _, p3, st, _, _ = bot._sql_counterparty_guard("x", q, ["Bundl Technologies"])
+    check("legal alias is substituted with the brand", st is None and p3 == ["SWIGGY"], f"{p3}")
+    _, _, st, _, _ = bot._sql_counterparty_guard("x", q, ["selection"])
+    check("ambiguous name asks rather than guesses", st == "AMBIGUOUS")
+    _, p4, st, _, _ = bot._sql_counterparty_guard(
+        "x", "SELECT 1 FROM my_transactions WHERE transaction_type = ? AND channel = ? "
+             "AND transaction_date >= ? LIMIT 1", ["debit", "UPI", "2026-01-01"])
+    check("enum and date params are not treated as names",
+          st is None and p4 == ["debit", "UPI", "2026-01-01"], f"{p4}")
+    bot._plan_llm = lambda m, h: ("query_sql", {
+        "sql": q, "params": ["ORACLE"], "purpose": "t"})
+    rr = bot.run("What did I spend on Oracle?")
+    check("forced through query_sql, an unknown vendor still hits the guardrail",
+          rr.status == A.GUARDRAIL and "Oracle" in rr.answer, f"{rr.status}: {rr.answer[:60]}")
+    bot._plan_llm = lambda m, h: ("query_sql", {
+        "sql": "SELECT * FROM txn_fact LIMIT 1", "params": [], "purpose": "escape"})
+    rr = bot.run("show me txn_fact")
+    check("forced through query_sql, an escape attempt is refused",
+          rr.status == A.GUARDRAIL and "txn_fact" in rr.answer)
+
+    # ---- bounded listings do not trigger the period gate -----------------
+    bot = A.FinanceAgent(con, session=sess)
+    for msg, args in [("last 5 transactions in bookmyshow", {"limit": 5, "order_by": "date"}),
+                      ("what was my highest transaction", {"order_by": "amount", "limit": 1}),
+                      ("which transaction is more than one lakh", {"min_amount": 100000}),
+                      ("what is my latest transaction", {"limit": 5})]:
+        check(f"bounded listing bypasses the period gate: {msg!r}",
+              bot._is_bounded_listing(msg, args, "list_transactions"))
+    check("an open aggregate is NOT bounded",
+          not bot._is_bounded_listing("how much did I spend on swiggy", {}, "get_spend"))
+
+    # ---- rules planner routing for the reported questions ----------------
+    routes = {
+        "which transaction is more than one lakh": ("list_transactions", {"min_amount": 100000.0}),
+        "what was the highest amount I have done in a transaction": ("list_transactions", {"order_by": "amount", "limit": 1, "ascending": False}),
+        "which is the lowest": ("list_transactions", {"order_by": "amount", "ascending": True}),
+        "on which month I have high expense": ("get_spend", {"group_by_month": True}),
+        "last 5 transactions in bookmyshow": ("list_transactions", {"limit": 5, "merchant": "BOOKMYSHOW"}),
+        "Show me the first transaction in the year 2026": ("list_transactions", {"ascending": True, "period": "year_2026", "limit": 1}),
+        "show me my other account details": ("get_balances", {}),
+        "which vendor have I spent on the most": ("rank_counterparties", {}),
+    }
+    for msg, (tool, want) in routes.items():
+        got_tool, got_args = bot._plan_rules(msg, [])
+        ok = got_tool == tool and all(got_args.get(k) == v for k, v in want.items())
+        check(f"rules route: {msg[:44]!r} -> {tool}", ok, f"got {got_tool} {got_args}")
+
+    # ---- resume replies that mean 'no restriction' -----------------------
+    r1 = bot.run("I want to calculate my spending for swiggy")
+    check("open merchant question still asks for a period", r1.status == A.CLARIFY)
+    for reply in ["no", "all", "doesn't matter", "no only swiggy"]:
+        r2 = bot.run(reply, pending=r1.pending)
+        check(f"reply {reply!r} resolves instead of re-asking", r2.status == A.ANSWER, r2.status)
+    r3 = bot.run("no only swiggy", pending=r1.pending)
+    check("'no only swiggy' also drops the counterparty filter",
+          r3.result is not None and not r3.result.filters.get("merchant"),
+          f"{r3.result.filters if r3.result else None}")
+    check("the original question is carried through a clarification",
+          r1.pending.get("original") == "I want to calculate my spending for swiggy")
+
+    # ---- names vs clauses vs time words ----------------------------------
+    check("a question clause is not a merchant",
+          A.extract_merchant("on which month I have high expense", bot.vocabulary) is None)
+    check("'on weekends' is a time phrase, not a merchant", A.looks_like_period("weekends"))
+    check("a real merchant is still a merchant",
+          A.extract_merchant("last 5 transactions in bookmyshow", bot.vocabulary) == "BOOKMYSHOW")
+
+    # ---- calendar years -----------------------------------------------------
+    for tok in ["2026", "year_2026", "in 2026", "the year 2025", "fy2026"]:
+        tr = db.resolve_time_range(tok, bot.anchor)
+        check(f"{tok!r} resolves to a whole calendar year",
+              tr.status == RESOLVED and tr.start.endswith("-01-01") and tr.end.endswith("-12-31")
+              and tr.month_aligned, f"{tr.status} {tr.start}..{tr.end}")
+    check("extract_period finds a bare year",
+          A.extract_period("Show me the first transaction in the year 2026") == "year_2026")
+
+    # ---- the narrator is told the scope it describes -----------------------
+    rl = bot.run("what was my latest transaction")
+    scope = X.describe_scope(rl.result)
+    check("describe_scope states an explicit 'no counterparty filter' for a wide listing",
+          "ALL" in scope and "both" in scope, scope)
+
+    # ---- explicit all-time wording is honoured even if the planner omits period
+    bot._plan_llm = lambda m, h: ("get_spend", {"merchant": "zomato", "direction": "debit"})
+    ra = bot.run("How much have I spent on Zomato total?")
+    check("'total' in the question forces all_time instead of a period question",
+          ra.status == A.ANSWER and ra.result.filters.get("start") is None,
+          f"{ra.status} {ra.result.filters if ra.result else None}")
+
+
 def main():
     if not os.path.exists(config.WAREHOUSE_PATH):
         print(f"No warehouse at {config.WAREHOUSE_PATH}. Run:\n"
@@ -992,6 +1157,7 @@ def main():
         test_query_layer(con)
         test_resolver(con)
         test_agent(con)
+        test_long_tail(con)
     finally:
         con.close()
 

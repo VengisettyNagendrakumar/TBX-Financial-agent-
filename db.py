@@ -352,6 +352,21 @@ def resolve_time_range(period, anchor_date: date) -> TimeRange:
                 )
             return TimeRange(status=UNRESOLVED, label=str(period), suggestions=_SUGGESTIONS)
 
+    # A calendar year: "2026", "year_2026", "in_2026", "the_year_2026", "fy_2026".
+    # Jan 1 - Dec 31, so it is month-aligned and takes the rollup path. A year
+    # past the anchor resolves to an honest empty window rather than an error.
+    if canonical is None:
+        m = re.match(r"^(?:the_)?(?:calendar_)?(?:year_|in_|fy_?|during_|for_)?((?:19|20)\d{2})$", p)
+        if m:
+            y = int(m.group(1))
+            return TimeRange(
+                status=RESOLVED,
+                start=date(y, 1, 1).strftime("%Y-%m-%d"),
+                end=date(y, 12, 31).strftime("%Y-%m-%d"),
+                label=f"the year {y}",
+                canonical=f"year_{y}",
+            )
+
     # last_n_days / last_30_days -- deliberately NOT month-aligned
     if canonical is None:
         m = re.match(r"^(?:last|past|previous|prior|trailing)_(\d{1,4})_days?$", p)

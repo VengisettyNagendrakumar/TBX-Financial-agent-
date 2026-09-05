@@ -36,6 +36,7 @@ import queries
 import resolver
 import explainer
 import llm
+import sqlguard
 from db import RESOLVED, ALL_TIME, UNRESOLVED
 from queries import UnresolvedFilterError
 
@@ -56,6 +57,10 @@ BAND_MEDIUM_MIN = 0.72
 # as confidently as any one of those alone.
 PERIOD_ASSUMED_FACTOR = 0.92      # no period given; answered over all history
 NARRATION_REJECTED_FACTOR = 0.85  # model wording failed the grounding check
+# Answered with model-written SQL (sandboxed, see sqlguard.py). The arithmetic
+# is still the database's, but the question -> query mapping was the model's
+# alone, with no typed tool contract constraining it.
+VIA_SQL_FACTOR = 0.85
 
 
 def band_for(score: float) -> str:
@@ -114,7 +119,8 @@ class AgentResult:
 PERIOD_DESC = ("Time period. Use a canonical token: 'last_month', 'this_month', "
                "'two_months_ago', 'last_3_months', 'last_6_months', 'last_30_days', "
                "'last_quarter', 'q1'..'q4', 'ytd', 'last_year', a month name like "
-               "'april', or 'all_time' when the user says total/overall/ever. "
+               "'april', a calendar year like 'year_2026' for 'in 2026' / "
+               "'the year 2026', or 'all_time' when the user says total/overall/ever. "
                "Omit entirely if the user gave no time period.")
 
 TOOLS = [
@@ -128,6 +134,9 @@ TOOLS = [
             "period": {"type": "string", "description": PERIOD_DESC},
             "direction": {"type": "string", "enum": ["debit", "credit"],
                           "description": "'debit' for money the user spent, 'credit' for money received."},
+            "group_by_month": {"type": "boolean",
+                               "description": "Set true for 'which month did I spend the "
+                                              "most', 'monthly breakdown', 'spend per month'."},
         }, "required": ["direction"]}}},
 
     {"type": "function", "function": {
@@ -172,13 +181,29 @@ TOOLS = [
             "merchant": {"type": "string"},
             "period": {"type": "string", "description": PERIOD_DESC},
             "direction": {"type": "string", "enum": ["debit", "credit"]},
-            "limit": {"type": "integer"},
+            "limit": {"type": "integer",
+                      "description": "How many rows. 'last 5 transactions' -> 5; "
+                                     "'highest/lowest transaction' -> 1."},
+            "order_by": {"type": "string", "enum": ["date", "amount"],
+                         "description": "'amount' for highest/lowest/largest/smallest "
+                                        "single transaction; 'date' (default) for "
+                                        "latest/recent."},
+            "ascending": {"type": "boolean",
+                          "description": "true for lowest/smallest/oldest; false (default) "
+                                         "for highest/largest/latest."},
+            "min_amount": {"type": "number",
+                           "description": "Only transactions >= this amount, e.g. 'more "
+                                          "than one lakh' -> 100000."},
+            "max_amount": {"type": "number"},
         }, "required": []}}},
 
     {"type": "function", "function": {
         "name": "get_balances",
-        "description": "Current account balances. Use for 'what is my balance', "
-                       "'how much do I have'.",
+        "description": "Account balances and account details. Use for 'what is my "
+                       "balance', 'how much do I have', 'show my other accounts', "
+                       "'account details', 'list my accounts', 'which banks am I "
+                       "with'. Prefer this over query_sql for anything about "
+                       "accounts rather than transactions.",
         "parameters": {"type": "object", "properties": {}, "required": []}}},
 
     {"type": "function", "function": {
@@ -189,6 +214,26 @@ TOOLS = [
             "question": {"type": "string"},
             "options": {"type": "array", "items": {"type": "string"}},
         }, "required": ["question"]}}},
+
+    {"type": "function", "function": {
+        "name": "query_sql",
+        "description": "FALLBACK when no other tool fits: thresholds ('transactions "
+                       "over 1 lakh'), counts, day-of-week or channel breakdowns, "
+                       "ranges, or any combination the typed tools cannot express. "
+                       "Write ONE SELECT over the two views in the schema. Never "
+                       "use this when get_spend / list_transactions / "
+                       "rank_counterparties / compare_spend / get_balances can "
+                       "answer -- they are more reliable.",
+        "parameters": {"type": "object", "properties": {
+            "sql": {"type": "string",
+                    "description": "One SELECT over my_transactions and/or my_accounts, "
+                                   "with '?' placeholders for every user-supplied "
+                                   "literal, and a LIMIT."},
+            "params": {"type": "array", "items": {},
+                       "description": "Values for the '?' placeholders, in order."},
+            "purpose": {"type": "string",
+                        "description": "One sentence: what this query answers."},
+        }, "required": ["sql", "params", "purpose"]}}},
 ]
 
 SYSTEM_PROMPT = """You convert personal-finance questions into tool calls.
@@ -207,7 +252,10 @@ Guidance:
   that", or similar, OMIT 'period_a' entirely -- the system derives the
   equal-length window immediately before 'period_b'. Never put a time phrase in
   'merchant'.
-- "my friend paid me" -> rank_counterparties(direction='credit', kind='person')
+- "my friend paid me" (NO name given) -> rank_counterparties(direction='credit',
+  kind='person'). But "Gautam Singh paid me" NAMES a person -> get_spend with
+  merchant='Gautam Singh', direction='credit'. A named individual is a single
+  total, never a ranking.
 - "total" / "overall" / "ever" / "all time" -> period='all_time'
 - If the user names no time period and is asking about one counterparty, still
   call the tool without a period; the system will ask if a period is needed.
@@ -220,6 +268,25 @@ Context rules:
   'merchant' for it, even if the previous turn was about one.
 - Leave 'direction' unset for a plain "what was my last transaction"; it may be
   money in or out.
+
+Single-transaction questions:
+- "highest / largest / biggest transaction or amount" -> list_transactions with
+  order_by='amount', ascending=false, limit=1. "lowest / smallest" -> ascending=true.
+  These are about ONE transaction, not a vendor ranking.
+- "transactions over / more than / above X" -> list_transactions with min_amount.
+  1 lakh = 100000, 1 crore = 10000000.
+- "last N transactions (with X)" -> list_transactions, limit=N, order_by='date'.
+  Do NOT ask for a period; "last N" is already bounded.
+- "which month did I spend the most / monthly breakdown" -> get_spend with
+  group_by_month=true.
+
+Fallback:
+- If, and only if, none of the tools above can express the question, use
+  query_sql with the schema below. Prefer a typed tool whenever one fits.
+- NEVER use query_sql for a question that names a merchant or a person. Use the
+  typed tools so the name is resolved against the customer's real history and
+  an unknown name is reported honestly, instead of returning an empty result
+  that looks like "you spent nothing".
 
 Call exactly one tool. Do not answer in prose."""
 
@@ -253,10 +320,51 @@ _GENERIC_SCOPE = re.compile(
     r"accounts?|spending)|anything|everything|regardless|as\s+a\s+whole|"
     r"entire\s+account|whole\s+account|overall\s+spending)\b", re.I)
 
+# Replies to "which period?" that mean "no restriction". Anything here resolves
+# to all-time instead of re-asking the same question.
+_NO_PERIOD_REPLY = re.compile(
+    r"^\s*(no|nope|none|n/a|na|any|all|everything|all time|all-time|whole|entire|"
+    r"doesn'?t matter|does not matter|don'?t care|skip|no filter|no period|"
+    r"not only\b.*|no only\b.*|no,?\s.*)\s*[.!]?\s*$", re.I)
+
+# ...and replies that ALSO widen the counterparty: "not only swiggy", "all vendors".
+_WIDEN_SCOPE_REPLY = re.compile(
+    r"\b(not only|no only|all (?:vendors|merchants|counterparties|transactions)|"
+    r"everything|everyone|any vendor|any merchant|across all)\b", re.I)
+
+# "more than one lakh", "over ₹50,000", "above 2.5 crore", "greater than 10k".
+_THRESHOLD = re.compile(
+    r"\b(?:more than|greater than|higher than|over|above|exceed(?:s|ing)?|at least|"
+    r"bigger than|larger than)\s+(?:₹|rs\.?|inr)?\s*"
+    r"(?P<num>\d[\d,]*(?:\.\d+)?|one|two|three|four|five|ten|half a|a)\s*"
+    r"(?P<unit>lakh|lakhs|lac|lacs|crore|crores|cr|k|thousand|million|mn)?\b", re.I)
+
+_NUMBER_WORD_VALUES = {"a": 1, "one": 1, "two": 2, "three": 3, "four": 4,
+                       "five": 5, "ten": 10, "half a": 0.5}
+_UNIT_MULTIPLIERS = {"lakh": 1e5, "lakhs": 1e5, "lac": 1e5, "lacs": 1e5,
+                     "crore": 1e7, "crores": 1e7, "cr": 1e7,
+                     "k": 1e3, "thousand": 1e3, "million": 1e6, "mn": 1e6}
+
+
+def _parse_amount(num: str, unit: str = None) -> float:
+    """'one' + 'lakh' -> 100000.0 ; '2.5' + 'crore' -> 25000000.0 ; '50,000' -> 50000.0"""
+    n = (num or "").strip().lower()
+    value = _NUMBER_WORD_VALUES.get(n)
+    if value is None:
+        value = float(n.replace(",", "") or 0)
+    return float(value * _UNIT_MULTIPLIERS.get((unit or "").lower(), 1))
+
+
 _ALL_TIME = re.compile(r"\b(in total|total|overall|all time|all-time|ever|lifetime|"
                        r"altogether|so far)\b", re.I)
 
 _PERIOD_PATTERNS = [
+    # A bare calendar year: "in 2026", "the year 2026", "during 2025", or a
+    # reply of just "2026" to "which period?". Resolves to Jan 1 - Dec 31.
+    (re.compile(r"\b(?:in|during|for|of|year|calendar year|fy)\s+((?:19|20)\d{2})\b", re.I),
+     lambda m: f"year_{m.group(1)}"),
+    (re.compile(r"^\s*((?:19|20)\d{2})\s*[.!?]?\s*$", re.I),
+     lambda m: f"year_{m.group(1)}"),
     (re.compile(r"\blast\s+(\d{1,2})\s+months?\b", re.I), lambda m: f"last_{m.group(1)}_months"),
     (re.compile(r"\bpast\s+(\d{1,2})\s+months?\b", re.I), lambda m: f"last_{m.group(1)}_months"),
     (re.compile(r"\blast\s+(\d{1,4})\s+days?\b", re.I), lambda m: f"last_{m.group(1)}_days"),
@@ -317,7 +425,11 @@ def extract_direction(text: str, default: str = config.TXN_DEBIT):
 _PERIOD_WORDS = re.compile(
     r"\b(month|months|week|weeks|year|years|quarter|quarters|day|days|"
     r"period|periods|ago|earlier|before|previous|prior|preceding|last|past|"
-    r"trailing|since|recent|yesterday|today|ytd|mtd|qtd|q[1-4])\b", re.I)
+    r"trailing|since|recent|yesterday|today|tomorrow|ytd|mtd|qtd|q[1-4]|"
+    # Days and parts of the day: "on weekends" is when, not whom.
+    r"weekend|weekends|weekday|weekdays|monday|tuesday|wednesday|thursday|"
+    r"friday|saturday|sunday|morning|mornings|afternoon|afternoons|evening|"
+    r"evenings|night|nights|daily|weekly|monthly|yearly|annually)\b", re.I)
 
 _MONTH_WORD = re.compile(
     r"\b(january|february|march|april|may|june|july|august|september|"
@@ -384,8 +496,19 @@ def extract_merchant(text: str, vocabulary: list):
         # "compare it to the 3 months before" -- the object of "to" is a period.
         if looks_like_period(cand):
             return None
+        # "on which month I have high expense" -- a clause, not a name. Merchant
+        # names do not contain question words or first-person pronouns; a
+        # candidate that does was produced by the preposition matching a
+        # sentence fragment, and resolving it yields a misleading NOT_FOUND.
+        if _CLAUSE_WORDS.search(cand):
+            return None
         return cand
     return None
+
+
+_CLAUSE_WORDS = re.compile(
+    r"\b(which|what|how|when|where|who|whom|why|i|i've|i'd|my|me|have|has|had|"
+    r"did|do|does|is|are|was|were|spent|spend|expense|expenses|spending)\b", re.I)
 
 
 # =============================================================
@@ -406,6 +529,13 @@ class FinanceAgent:
         self._people = [v["name"] for v in self.vocabulary
                         if v["kind"] == config.KIND_PERSON]
 
+        # Per-turn side-channel for rich objects (QueryResult, Resolution,
+        # TimeRange, Confidence), keyed by run_id. They are kept OUT of the
+        # LangGraph state so checkpoints stay plain msgpack: pickling a
+        # DataFrame-bearing class broke the app the moment Streamlit
+        # hot-reloaded queries.py ("not the same object as queries.QueryResult").
+        self._scratch = {}
+
         # Compiled once; the topology is static, only the state varies.
         from graph import build_graph
         self._graph = build_graph(self, checkpointer=checkpointer)
@@ -416,8 +546,12 @@ class FinanceAgent:
         if not llm.is_configured():
             return None
         try:
-            msgs = [{"role": "system",
-                     "content": SYSTEM_PROMPT.format(anchor=self.anchor)}]
+            # The schema for the SQL fallback travels in the system prompt.
+            # It is column names and enums only -- never rows -- so the model
+            # can write a query without ever having seen data.
+            system = (SYSTEM_PROMPT.format(anchor=self.anchor) + "\n\n"
+                      + sqlguard.SCHEMA_DOC.format(anchor=self.anchor))
+            msgs = [{"role": "system", "content": system}]
             for h in history[-4:]:
                 if h.get("role") in ("user", "assistant") and h.get("content"):
                     msgs.append({"role": h["role"], "content": str(h["content"])[:500]})
@@ -446,7 +580,8 @@ class FinanceAgent:
         # Checked before the generic "show me …" branch, which would otherwise
         # swallow "show me all my accounts" as a transaction listing.
         if re.search(r"\b(balances?|how much do i have|in my account|savings|current|checking)\b"
-                     r"|\b(?:all\s+)?(?:my\s+)?accounts?\b", low):
+                     r"|\b(?:all\s+|other\s+)?(?:my\s+)?(?:other\s+)?accounts?\b"
+                     r"|\baccounts?\s+(?:details?|info(?:rmation)?|summary|list)\b", low):
             return "get_balances", {}
 
         if re.search(r"\b(compare|versus|vs\.?|difference between)\b", low) or \
@@ -462,6 +597,38 @@ class FinanceAgent:
                 "direction": direction,
             }
 
+        # "Which month did I spend the most" is a monthly breakdown, not a
+        # vendor ranking -- checked before the rank branch, which would
+        # otherwise claim "most".
+        if re.search(r"\bwhich month\b|\bmonthly\b|\bby month\b|\bper month\b|"
+                     r"\bmonth(?:s)?\b.{0,20}\b(high(?:est)?|most|least|lowest)\b", low):
+            return "get_spend", {"merchant": merchant, "period": period,
+                                 "direction": direction, "group_by_month": True}
+
+        # "Transactions over one lakh": a threshold listing. Parsed first so the
+        # amount is not mistaken for a limit.
+        thr = _THRESHOLD.search(text)
+        if thr:
+            return "list_transactions", {
+                "merchant": merchant, "period": period, "direction": direction,
+                "min_amount": _parse_amount(thr.group("num"), thr.group("unit")),
+                "order_by": "amount", "limit": 50}
+
+        # "Highest amount I have done in a transaction" is ONE transaction. The
+        # vendor ranking branch below must not claim it: it says "vendor" or
+        # "who", this says "transaction" / "amount" / "payment".
+        # No noun is required: "which is the lowest?" as a follow-up to
+        # "highest transaction" has none. What routes it AWAY from here is a
+        # vendor/person word ("which vendor did I spend most on" -> ranking).
+        ext = re.search(r"\b(highest|largest|biggest|max(?:imum)?|lowest|smallest|"
+                        r"min(?:imum)?|cheapest|most expensive)\b", low)
+        if ext and not re.search(r"\b(vendor|merchant|counterpart(?:y|ies)|who|whom|"
+                                 r"person|people|friend|month|months|week|year)\b", low):
+            asc = bool(re.search(r"\b(lowest|smallest|min(?:imum)?|cheapest)\b", low))
+            return "list_transactions", {
+                "merchant": merchant, "period": period, "direction": direction,
+                "order_by": "amount", "ascending": asc, "limit": 1}
+
         if re.search(r"\b(most|highest|top|largest|biggest|ranked?|who did i)\b", low):
             kind = None
             if re.search(r"\b(friend|person|people|someone|who)\b", low):
@@ -474,11 +641,18 @@ class FinanceAgent:
                 "direction": config.TXN_CREDIT, "period": period,
                 "kind": config.KIND_PERSON, "limit": 10}
 
-        # "What was my last transaction?" wants the most recent rows, not a
-        # spend total. Without this it lands on get_spend and reports a sum.
-        if re.search(r"\b(last|latest|most recent|recent)\b[\w\s]{0,15}\btransactions?\b", low):
+        # "Last 5 transactions with BookMyShow" / "latest transaction": the most
+        # recent N rows. An explicit count wins; otherwise a small default.
+        # "first transaction in 2026" / "earliest 3 transactions" are the SAME
+        # shape with the order flipped: oldest first.
+        recent = re.search(r"\b(last|latest|most recent|recent|first|earliest|oldest)"
+                           r"\s+(\d{1,3})?\s*(?:\w+\s+)?transactions?\b", low)
+        if recent:
+            n = int(recent.group(2)) if recent.group(2) else (
+                1 if recent.group(1) in ("first", "earliest", "oldest") else 5)
             return "list_transactions", {
-                "merchant": merchant, "period": period, "limit": 5}
+                "merchant": merchant, "period": period, "limit": n, "order_by": "date",
+                "ascending": recent.group(1) in ("first", "earliest", "oldest")}
 
         if re.search(r"\b(list|show me|show all|transactions|breakdown|itemi[sz]e)\b", low):
             return "list_transactions", {
@@ -571,7 +745,8 @@ class FinanceAgent:
 
         return inherited
 
-    def _confidence(self, resolution, tr, explicit_period, result, narration) -> Confidence:
+    def _confidence(self, resolution, tr, explicit_period, result, narration,
+                    via_sql: bool = False) -> Confidence:
         """
         Composite of interpretation risk. See ARCHITECTURE_V2.md §13.
 
@@ -610,8 +785,11 @@ class FinanceAgent:
         elif tr is not None and tr.status == ALL_TIME:
             reasons.append("Answered over all available history, as asked")
 
-        # 3. Data attribution.
-        if result is not None:
+        # 3. Data attribution. Irrelevant for a query that never read
+        #    transactions (an accounts lookup via generated SQL), so skipped.
+        reads_txns = not (via_sql and result is not None
+                          and sqlguard.VIEW_TXN not in (result.sql or "").lower())
+        if result is not None and reads_txns:
             unattributed = self._unattributed_share(
                 (result.filters or {}).get("direction"), tr)
             if unattributed > 0.02:
@@ -629,6 +807,16 @@ class FinanceAgent:
             score *= NARRATION_REJECTED_FACTOR
             reasons.append("The model produced a figure the database did not return; "
                            "its wording was discarded and a verified summary used")
+
+        # 5. Generated SQL. The database still did the arithmetic and the
+        #    sandbox still scoped the data, but the question -> query mapping
+        #    was the model's alone, with no typed contract to catch a
+        #    misreading. Say so, and band it down.
+        if via_sql:
+            score *= VIA_SQL_FACTOR
+            reasons.append("Answered with model-written SQL (sandboxed and scoped to "
+                           "your accounts) because no built-in tool matched the "
+                           "question — check the query in the audit trace")
 
         score = round(max(0.0, min(1.0, score)), 3)
         return Confidence(score=score, label=band_for(score), reasons=reasons)
@@ -705,7 +893,102 @@ class FinanceAgent:
                      "period": args.get("period"), "kind": config.KIND_PERSON},
         )
 
-    def _gate_period(self, merchant_canonical, period_token, tr, explicit):
+    # A request that is already bounded some other way: by recency ("last 5"),
+    # by an extreme ("highest"), by a threshold ("over 1 lakh"), or by an
+    # explicit count. Asking "which period?" for these is not clarification --
+    # it is a question the user already answered.
+    _BOUNDED = re.compile(
+        r"\b(last|latest|most recent|recent|first|earliest|oldest|highest|lowest|"
+        r"largest|smallest|biggest|max(?:imum)?|min(?:imum)?|top|bottom)\b|"
+        r"\b(more|greater|less|fewer|higher|lower)\s+than\b|\b(over|above|below|under|"
+        r"exceed(?:s|ing)?|at least|at most)\s+(?:₹|rs\.?|inr)?\s*[\d,.]+", re.I)
+
+    def _is_bounded_listing(self, message: str, args: dict, tool: str) -> bool:
+        """
+        True when a listing is already bounded without a period: by recency
+        ("last 5"), an extreme ("highest"), a threshold ("over 1 lakh"), or an
+        explicit small count.
+
+        Shared by the period gate (which must not ask) and by confidence (which
+        must not penalise): for these questions all-time is the CORRECT scope,
+        not an assumption made on the user's behalf.
+        """
+        if tool != "list_transactions":
+            return False
+        args = args or {}
+        limit = args.get("limit")
+        try:
+            small = limit is not None and int(limit) <= 10
+        except (TypeError, ValueError):
+            small = False
+        return bool(args.get("min_amount") is not None
+                    or args.get("max_amount") is not None
+                    or args.get("order_by") == "amount"
+                    or small
+                    or self._BOUNDED.search(message or ""))
+
+    # Values that are legitimately string params in generated SQL but are not
+    # counterparty names, so they must not be pushed through the resolver.
+    _SQL_ENUM_VALUES = frozenset(
+        v.lower() for v in (config.TXN_DEBIT, config.TXN_CREDIT,
+                            config.KIND_MERCHANT, config.KIND_PERSON,
+                            config.KIND_BANK_CHARGE, config.KIND_SELF_TRANSFER,
+                            config.KIND_UNKNOWN, config.CHANNEL_UPI, config.CHANNEL_NEFT,
+                            config.CHANNEL_IMPS, config.CHANNEL_RTGS, config.CHANNEL_FT,
+                            config.CHANNEL_CHARGE, config.CHANNEL_OTHER))
+    _SQL_LITERAL = re.compile(r"'((?:[^']|'')+)'")
+    _DATE_LIKE = re.compile(r"^\d{4}-\d{2}(-\d{2})?")
+
+    def _sql_counterparty_guard(self, message: str, sql: str, params: list):
+        """
+        Keeps generated SQL from being a way around entity resolution.
+
+        Without this, "what did I spend on Oracle?" could become
+        `WHERE merchant = 'ORACLE'`, return zero rows, and be narrated as
+        "you spent nothing" -- when the truth is that this customer has never
+        transacted with anyone called Oracle. Every string the model used as a
+        filter is resolved against the customer's real vocabulary:
+
+            NOT_FOUND  -> the same guardrail the typed tools produce
+            AMBIGUOUS  -> the same clarifying question
+            MATCH      -> the canonical name is substituted, so 'swiggy' finds
+                          SWIGGY and 'Bundl Technologies' finds it too
+
+        Returns (sql, params, status, resolution, name_as_given).
+        """
+        if not self.vocabulary:
+            return sql, params, None, None, None
+        candidates = []
+        for p in params or []:
+            if isinstance(p, str):
+                candidates.append(("param", p))
+        for lit in self._SQL_LITERAL.findall(sql or ""):
+            candidates.append(("literal", lit.replace("''", "'")))
+
+        new_sql, new_params = sql, list(params or [])
+        for where, raw in candidates:
+            s = str(raw).strip()
+            low = s.lower()
+            if (not s or len(s) < 2 or low in self._SQL_ENUM_VALUES
+                    or self._DATE_LIKE.match(s) or re.fullmatch(r"[\d.,%\s-]+", s)
+                    or looks_like_period(s)):
+                continue
+            res = resolver.resolve_merchant(self.con, self.entity_id, s,
+                                            vocabulary=self.vocabulary)
+            if res.status == resolver.NOT_FOUND:
+                return sql, params, resolver.NOT_FOUND, res, s
+            if res.status == resolver.AMBIGUOUS:
+                return sql, params, resolver.AMBIGUOUS, res, s
+            if res.status == resolver.MATCH and res.entity and res.entity != s:
+                if where == "param":
+                    new_params = [res.entity if (isinstance(p, str) and p == raw) else p
+                                  for p in new_params]
+                else:
+                    new_sql = new_sql.replace(f"'{raw}'", "'" + res.entity.replace("'", "''") + "'")
+        return new_sql, new_params, None, None, None
+
+    def _gate_period(self, merchant_canonical, period_token, tr, explicit,
+                     message: str = None, args: dict = None, tool: str = None):
         """
         Policy gate: a counterparty with history across several months, and no
         period given, is ambiguous in a way that matters.
@@ -713,8 +996,15 @@ class FinanceAgent:
         This is the flow from the brief:
             user:  I want to calculate my spending for swiggy
             agent: for which months? past n months or all?
+
+        The gate exists for AGGREGATES -- "how much" over an open-ended window
+        is genuinely ambiguous. A listing that is already bounded by recency,
+        an extreme, a threshold or an explicit count is not, so it passes:
+        "last 5 transactions with BookMyShow" needs no period to be answerable.
         """
         if explicit or not merchant_canonical:
+            return None
+        if self._is_bounded_listing(message, args, tool):
             return None
         stats = next((v for v in self.vocabulary if v["name"] == merchant_canonical), None)
         months = int(stats.get("active_months") or 0) if stats else 0
@@ -744,8 +1034,11 @@ class FinanceAgent:
         only affect where checkpoints are written.
         """
         t0 = time.perf_counter()
+        # One slot per turn; nodes park rich objects here instead of in state.
+        run_id = uuid.uuid4().hex
+        self._scratch[run_id] = {}
         state = {"message": message, "history": history or [],
-                 "pending_in": pending or {}, "trace": []}
+                 "pending_in": pending or {}, "trace": [], "run_id": run_id}
 
         # `thread_id` here is the CONVERSATION id. The graph gets a derived
         # per-turn thread instead, because a LangGraph thread is one continuing
@@ -779,19 +1072,32 @@ class FinanceAgent:
             final = {"status": ERROR, "answer": f"Something went wrong: {e}",
                      "trace": state["trace"]}
 
+        # Carry the ORIGINAL question through a clarification. The reply that
+        # resumes it ("no only swiggy", "last 3 months") is not a question, and
+        # a narrator handed only that text invents one -- it once explained
+        # that there were "no transactions with Swiggy" after the user had just
+        # asked to drop the Swiggy filter.
+        # Collect the rich objects the nodes parked for this turn, and free the
+        # slot whether the turn succeeded, clarified, or raised.
+        sc = self._scratch.pop(run_id, {})
+
+        pend = dict(final.get("pending_out") or {})
+        if final.get("status") == CLARIFY:
+            pend.setdefault("original", (pending or {}).get("original") or message)
+
         return AgentResult(
             status=final.get("status", ERROR),
             answer=final.get("answer", ""),
             question=final.get("question", ""),
             options=final.get("options", []) or [],
-            result=final.get("result"),
+            result=sc.get("result"),
             kind=final.get("result_kind", ""),
             trace=final.get("trace", []) or [],
             planner=final.get("planner", ""),
             narration=final.get("narration", ""),
-            pending=final.get("pending_out", {}) or {},
-            resolution=final.get("resolution"),
-            confidence=final.get("confidence") or Confidence(),
+            pending=pend,
+            resolution=sc.get("resolution"),
+            confidence=sc.get("confidence") or Confidence(),
             inherited=final.get("inherited", {}) or {},
             latency_ms=round((time.perf_counter() - t0) * 1000, 2),
         )
@@ -801,11 +1107,23 @@ class FinanceAgent:
         slot = pending.get("slot")
         tool = pending.get("tool", "get_spend")
         args = {k: v for k, v in pending.items()
-                if k not in ("slot", "question", "options", "tool")}
+                if k not in ("slot", "question", "options", "tool", "original")}
         if slot == "period":
+            reply = (message or "").strip().lower()
+            # "no", "all", "doesn't matter" answer the question -- with "no
+            # restriction". Without this the same clarification is re-asked in
+            # a loop, which is what happened with "no only swiggy".
+            if _NO_PERIOD_REPLY.search(reply):
+                args["period"] = "all_time"
+                # "not only swiggy" / "all vendors" also widens the counterparty.
+                if _WIDEN_SCOPE_REPLY.search(reply):
+                    args.pop("merchant", None)
+                    if tool == "get_spend":
+                        tool = "list_transactions"
+                return tool, {**args, "direction": args.get("direction", config.TXN_DEBIT)}
             token = extract_period(message) or extract_period(f"in {message}")
             if token is None:
-                norm = re.sub(r"[\s\-]+", "_", message.strip().lower())
+                norm = re.sub(r"[\s\-]+", "_", reply)
                 probe = db.resolve_time_range(norm, self.anchor)
                 token = norm if probe.status != UNRESOLVED else None
             if token is None:

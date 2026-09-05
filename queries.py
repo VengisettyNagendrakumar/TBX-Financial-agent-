@@ -222,6 +222,22 @@ def query_spend(con, entity_id: str, direction: str, time_range=None,
         """
     rows = db.query_df(con, rows_sql, params)
 
+    if group_by_month and not rows.empty:
+        # The narrator must be HANDED the top month, not left to find it in a
+        # sample: given eight of twenty-four rows it confidently named the
+        # wrong month (BUGS.md B05 in a new outfit). These facts are computed
+        # over every row.
+        ranked = rows.sort_values("total_amount", ascending=False)
+        top, low = ranked.iloc[0], ranked.iloc[-1]
+        facts.update({
+            "months": int(len(rows)),
+            "top_month": str(top["month"])[:7],
+            "top_month_total": round(float(top["total_amount"]), 2),
+            "low_month": str(low["month"])[:7],
+            "low_month_total": round(float(low["total_amount"]), 2),
+            "monthly_average": round(float(rows["total_amount"].mean()), 2),
+        })
+
     notes = []
     if not use_rollup and tr.status == RESOLVED:
         notes.append("Window is not month-aligned; answered from the transaction "
@@ -351,15 +367,29 @@ def top_counterparties(con, entity_id: str, direction: str, time_range=None,
 MAX_LIST_ROWS = 200
 
 
+ORDER_COLUMNS = {"date": "date_col", "amount": "amount_col"}
+
+
 def list_transactions(con, entity_id: str, direction: str = None, time_range=None,
                       merchant: str = None, kind: str = None,
-                      limit: int = 50) -> QueryResult:
-    """Individual rows. Always reads the fact table; descriptions are redacted."""
+                      limit: int = 50, order_by: str = "date", ascending: bool = False,
+                      min_amount: float = None, max_amount: float = None) -> QueryResult:
+    """
+    Individual rows. Always reads the fact table; descriptions are redacted.
+
+    `order_by="amount"` with limit 1 answers "what was my highest transaction";
+    `ascending=True` the lowest. `min_amount` answers "which transactions were
+    over a lakh". These are deterministic, so the rules planner can answer them
+    without a model -- the generated-SQL fallback is for shapes not covered.
+    """
     t0 = time.perf_counter()
     _require_entity(entity_id)
     tr = _coerce_range(time_range)
     txn = config.SCHEMA_CONFIG["transaction"]
     limit = max(1, min(int(limit), MAX_LIST_ROWS))
+    if order_by not in ORDER_COLUMNS:
+        raise ValueError(f"order_by must be one of {sorted(ORDER_COLUMNS)}, got {order_by!r}")
+    order_col = txn[ORDER_COLUMNS[order_by]]
 
     where = ["entity_id = ?"]
     params = [entity_id]
@@ -377,6 +407,12 @@ def list_transactions(con, entity_id: str, direction: str = None, time_range=Non
         where.append(f"{txn['date_col']} >= CAST(? AS DATE)")
         where.append(f"{txn['date_col']} < CAST(? AS DATE) + INTERVAL 1 DAY")
         params.extend([tr.start, tr.end])
+    if min_amount is not None:
+        where.append(f"{txn['amount_col']} >= ?")
+        params.append(float(min_amount))
+    if max_amount is not None:
+        where.append(f"{txn['amount_col']} <= ?")
+        params.append(float(max_amount))
     clause = " AND ".join(where)
 
     f = db.query_df(con, f"""
@@ -392,7 +428,8 @@ def list_transactions(con, entity_id: str, direction: str = None, time_range=Non
                {txn['amount_col']} AS amount, channel,
                {txn['ref_col']} AS reference_id, {txn['desc_col']} AS description
         FROM {config.TABLE_TXN_FACT} WHERE {clause}
-        ORDER BY {txn['date_col']} DESC LIMIT {limit}
+        ORDER BY {order_col} {'ASC' if ascending else 'DESC'}, {txn['date_col']} DESC
+        LIMIT {limit}
     """
     rows = db.query_df(con, rows_sql, params)
     if not rows.empty and "description" in rows.columns:
@@ -405,7 +442,20 @@ def list_transactions(con, entity_id: str, direction: str = None, time_range=Non
         "shown": len(rows),
         "period": tr.label,
         "merchant": merchant,
+        "order_by": order_by,
+        "ascending": ascending,
+        "min_amount": min_amount,
+        "max_amount": max_amount,
     }
+    # A single-row extreme ("highest transaction") is quoted verbatim so the
+    # narrator can name the row rather than only its amount.
+    if len(rows) <= 5 and not rows.empty:
+        facts["rows"] = [
+            {k: (str(v) if not isinstance(v, (int, float)) else v) for k, v in r.items()}
+            for r in rows.to_dict(orient="records")]
+        if "amount" in rows.columns:
+            facts["max_value"] = round(float(rows["amount"].max()), 2)
+            facts["min_value"] = round(float(rows["amount"].min()), 2)
     notes = []
     if total_rows > len(rows):
         notes.append(f"Showing {len(rows)} of {total_rows} transactions. "

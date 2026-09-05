@@ -127,6 +127,41 @@ def format_facts(facts: dict) -> dict:
     return out
 
 
+def describe_scope(result) -> str:
+    """
+    The scope a result actually covers, stated for the narrator.
+
+    Left to infer scope from the user's wording, the model reasons about the
+    words instead of the data: after a user dropped the Swiggy filter it
+    reported "no transactions labelled Swiggy" because Swiggy was in the
+    question and not in the table. Telling it the resolved scope removes the
+    inference.
+    """
+    fl = result.filters or {}
+    if fl.get("via") == "generated_sql":
+        return (f"A custom query over the customer's own transactions/accounts. "
+                f"Purpose: {fl.get('purpose') or 'as asked'}.")
+    bits = []
+    m = fl.get("merchant")
+    bits.append(f"counterparty = {m}" if m else
+                "counterparty = ALL (no counterparty filter is applied)")
+    if fl.get("period"):
+        bits.append(f"period = {fl['period']}")
+    elif fl.get("start") and fl.get("end"):
+        bits.append(f"period = {fl['start']} to {fl['end']}")
+    else:
+        bits.append("period = all available history")
+    d = fl.get("direction")
+    bits.append("direction = money out (debit)" if d == config.TXN_DEBIT else
+                "direction = money in (credit)" if d == config.TXN_CREDIT else
+                "direction = both in and out")
+    if fl.get("kind"):
+        bits.append(f"counterparty kind = {fl['kind']}")
+    if fl.get("account_id"):
+        bits.append("account = the customer's primary account")
+    return "; ".join(bits)
+
+
 def money(v) -> str:
     try:
         return f"{config.CURRENCY_SYMBOL}{float(v):,.2f}"
@@ -141,6 +176,21 @@ def money(v) -> str:
 def template_answer(kind: str, result, resolution=None) -> str:
     f = result.facts
     period = f.get("period") or "all time"
+
+    if kind == "spend" and result.rows is not None and "month" in result.rows.columns \
+            and not result.rows.empty:
+        # Monthly breakdown: "on which month did I spend the most". The rows
+        # are ordered by month; rank them here so the top month is named.
+        r = result.rows.copy()
+        r["total_amount"] = r["total_amount"].astype(float)
+        top = r.sort_values("total_amount", ascending=False).iloc[0]
+        low = r.sort_values("total_amount", ascending=True).iloc[0]
+        name = f.get("merchant")
+        who = f" with **{name}**" if name else ""
+        return (f"Your highest-spending month{who} was **{str(top['month'])[:7]}** at "
+                f"**{money(top['total_amount'])}**; the lowest was "
+                f"**{str(low['month'])[:7]}** at **{money(low['total_amount'])}**. "
+                f"Across all **{len(r)}** months the total is **{money(f['grand_total'])}**.")
 
     if kind == "spend":
         name = f.get("merchant")
@@ -178,13 +228,44 @@ def template_answer(kind: str, result, resolution=None) -> str:
                 f"**{money(abs(d))}** {direction}{pct_txt}.")
 
     if kind == "list":
+        who = f" with **{f['merchant']}**" if f.get("merchant") else ""
+        floor = f.get("min_amount")
         if result.rows.empty:
-            return f"No transactions found for {period}."
-        shown = ""
+            if floor is not None:
+                return (f"No transactions{who} of **{money(floor)}** or more in {period}. "
+                        f"Every transaction in that scope is below that amount.")
+            return f"No transactions found{who} for {period}."
+
+        by_amount = f.get("order_by") == "amount"
+        n_shown = len(result.rows)
+
+        # A single-row extreme is an answer about one transaction; name it.
+        if by_amount and n_shown == 1 and f.get("rows"):
+            row = f["rows"][0]
+            which = "lowest" if f.get("ascending") else "highest"
+            cp = row.get("merchant_norm") or "?"
+            # The largest row is often unattributed narration; say so rather
+            # than printing the sentinel as if it were a company.
+            cp_txt = ("an **unidentified counterparty**" if cp == config.UNKNOWN_MERCHANT
+                      else f"**{cp}**")
+            return (f"Your {which} transaction{who} was **{money(row.get('amount', 0))}** "
+                    f"— a {row.get('transaction_type', '')} to {cp_txt} "
+                    f"on {str(row.get('transaction_date', ''))[:19]} via {row.get('channel', '?')}. "
+                    f"That is out of **{f['txn_count']}** transaction(s) in {period}.")
+
+        if floor is not None:
+            return (f"**{f['txn_count']}** transaction(s){who} of **{money(floor)}** or more "
+                    f"in {period}, totalling **{money(f['grand_total'])}**"
+                    + (f"; showing the largest {n_shown}." if result.truncated else "."))
+
+        recency = "most recent" if f.get("order_by", "date") == "date" else (
+            "smallest" if f.get("ascending") else "largest")
         if result.truncated:
-            shown = f", showing the most recent {len(result.rows)}"
-        return (f"Found **{f['txn_count']}** transaction(s) totalling "
-                f"**{money(f['grand_total'])}** in {period}{shown}.")
+            return (f"Found **{f['txn_count']}** transaction(s){who} totalling "
+                    f"**{money(f['grand_total'])}** in {period}; showing the "
+                    f"{recency} {n_shown}.")
+        return (f"Found **{f['txn_count']}** transaction(s){who} totalling "
+                f"**{money(f['grand_total'])}** in {period}.")
 
     if kind == "balances":
         if result.rows.empty:
@@ -198,6 +279,23 @@ def template_answer(kind: str, result, resolution=None) -> str:
                     f"available balance of **{money(f['grand_total'])}**.{extra}")
         return (f"You have **{f['account_count']}** account(s) with a combined "
                 f"balance of **{money(f['grand_total'])}**.")
+
+    if kind == "sql":
+        n = f.get("row_count", 0)
+        if n == 0:
+            return "No rows matched that query."
+        head = f.get("headline_column")
+        parts = [f"Found **{n}** row(s)" + (f"; showing the first {len(result.rows)}"
+                                           if result.truncated else "") + "."]
+        if head:
+            parts.append(f"`{head}`: total **{money(f['grand_total'])}**, "
+                         f"highest **{money(f.get('max_value', 0))}**, "
+                         f"lowest **{money(f.get('min_value', 0))}**.")
+        if f.get("rows") and n == 1:
+            row = f["rows"][0]
+            parts.append("Row: " + ", ".join(f"{k} = {v}" for k, v in row.items()
+                                              if k != "description"))
+        return " ".join(parts)
 
     return f"Result: {money(f.get('grand_total', 0))} across {f.get('txn_count', 0)} transaction(s)."
 
@@ -221,6 +319,10 @@ Rules:
    thousands separators and decimal places. Do not reformat them.
 5. If NOTES mention exclusions or truncation, mention that briefly.
 6. Do not invent context, advice, or commentary. Answer the question.
+   Describe exactly the INTERPRETATION scope. If the question mentions a name
+   that is NOT in the interpretation, the user chose to drop that filter (for
+   example after a clarification) -- describe the wider scope; never claim the
+   name is absent from the data.
 7. If counterparty_kind is 'person', these are individuals -- call them people,
    never merchants or vendors."""
 
@@ -243,8 +345,10 @@ def generate(user_question: str, kind: str, result, resolution=None) -> tuple:
 
         prompt = (
             f"USER QUESTION: {user_question}\n\n"
+            f"INTERPRETATION (the scope these facts describe; authoritative):\n"
+            f"{describe_scope(result)}\n\n"
             f"FACTS (authoritative, computed by the database):\n"
-            f"{ {k: v for k, v in result.facts.items() if v is not None} }\n\n"
+            f"{format_facts(result.facts)}\n\n"
             f"SAMPLE ROWS (partial view, {len(sample)} of "
             f"{result.total_group_count or len(result.rows)}):\n{sample}\n\n"
             f"NOTES: {result.notes or 'none'}\n\n"

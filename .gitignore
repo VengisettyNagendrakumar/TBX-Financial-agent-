@@ -14,3 +14,7 @@ data/*.csv
 
 # local conversation history
 chats.db
+chats.db-shm
+chats.db-wal
+chats.db-wal
+chats.db-shm

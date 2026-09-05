@@ -43,8 +43,32 @@ import db
 import explainer
 import queries
 import resolver
+import sqlguard
+import llm
 from db import RESOLVED, ALL_TIME, UNRESOLVED
 from queries import UnresolvedFilterError
+
+
+# Words that name a filter the rules planner has no way to apply. Used only to
+# label an un-filtered answer honestly when no model is configured.
+_UNEXPRESSIBLE = re.compile(
+    r"\b(weekends?|weekdays?|monday|tuesday|wednesday|thursday|friday|saturday|"
+    r"sunday|mornings?|evenings?|nights?|upi|neft|imps|rtgs|how many|count|"
+    r"number of|average|median|percent(?:age)?)\b", re.I)
+
+
+def _as_typed(message: str, name: str) -> str:
+    """
+    The user's own spelling of a name, recovered from their message.
+
+    The model normalises arguments (the schema doc asks for UPPERCASE), so an
+    error that echoes the argument shouts "ORACLE" back at someone who typed
+    "Oracle". Falls back to the argument when the name is not in the message.
+    """
+    if not message or not name:
+        return name or ""
+    m = re.search(re.escape(str(name)), message, re.I)
+    return m.group(0) if m else str(name)
 
 
 class TurnState(TypedDict, total=False):
@@ -58,22 +82,26 @@ class TurnState(TypedDict, total=False):
     args: dict
     planner: str
     inherited: dict
+    # Rich objects (QueryResult, Resolution, TimeRange, Confidence) are NOT in
+    # the state. They live in agent._scratch[run_id] for the duration of one
+    # turn. The checkpointer serialises state, and pickling a DataFrame-bearing
+    # class broke the moment Streamlit hot-reloaded queries.py: "Can't pickle
+    # QueryResult: it's not the same object as queries.QueryResult". Keeping
+    # state to plain JSON types makes every checkpoint msgpack-native and
+    # immune to class-identity drift.
+    run_id: str
     # resolution
     direction: Optional[str]
     raw_merchant: Optional[str]
     canonical: Optional[str]
-    resolution: Any
     kind: Optional[str]
     # period
     period_token: Optional[str]
-    time_range: Any
     explicit_period: bool
     # results
-    result: Any
     result_kind: str
     answer: str
     narration: str
-    confidence: Any
     # outcome
     status: str
     question: str
@@ -91,7 +119,17 @@ def build_graph(agent, checkpointer=None):
     """
     # Imported lazily to avoid a circular import at module load.
     from agent import (ANSWER, CLARIFY, GUARDRAIL, Confidence, HIGH,
-                       explicit_direction, looks_like_period)
+                       explicit_direction, looks_like_period, extract_merchant,
+                       _ALL_TIME)
+
+    def _sc(state: TurnState) -> dict:
+        """
+        This turn's side-channel for rich objects.
+
+        Keyed by run_id so concurrent turns (Streamlit sessions) never share a
+        slot. run() creates the entry and pops it when the turn ends.
+        """
+        return agent._scratch.setdefault(state.get("run_id") or "_", {})
 
     # ---------------------------------------------------------------- plan
 
@@ -112,9 +150,16 @@ def build_graph(agent, checkpointer=None):
                                    "tool": "clarify", "args": {},
                                    "resolved": False}]}
             tool, args = merged
-            return {"tool": tool, "args": args, "planner": "resume",
-                    "trace": [{"step": "plan", "planner": "resume",
-                               "tool": tool, "args": dict(args)}]}
+            out = {"tool": tool, "args": args, "planner": "resume",
+                   "trace": [{"step": "plan", "planner": "resume",
+                              "tool": tool, "args": dict(args)}]}
+            # Downstream nodes (direction, bounded-listing check, narration)
+            # read state["message"]. Give them the question being answered,
+            # not the two-word reply that resumed it.
+            if pending.get("original"):
+                out["message"] = (f"{pending['original']} "
+                                  f"(the user then clarified: \"{message}\")")
+            return out
 
         chosen = agent._plan_llm(message, state.get("history") or [])
         planner = "llm"
@@ -130,9 +175,36 @@ def build_graph(agent, checkpointer=None):
         if state.get("planner") == "resume":
             return {"inherited": {}}
         args = state["args"]
+        tool = state["tool"]
         inherited = agent._inherit_context(
-            state["message"], state["tool"], args, state.get("history") or [])
+            state["message"], tool, args, state.get("history") or [])
         out = {"inherited": inherited, "args": args}
+
+        # "Zomato TOTAL" / "overall" / "ever" is an explicit all-time request.
+        # The planner sometimes omits period for it, and the period gate then
+        # asks a question the user already answered. The rules planner maps
+        # these words deterministically; this gives the model path parity.
+        if (tool in ("get_spend", "list_transactions", "compare_spend")
+                and not args.get("period") and _ALL_TIME.search(state["message"] or "")):
+            args["period"] = "all_time"
+            out.setdefault("trace", []).append(
+                {"step": "normalise", "period": "all_time",
+                 "reason": "explicit all-time wording in the question"})
+
+        # A ranking of persons that NAMES one person is a single total. The
+        # planner sometimes reaches for rank_counterparties(kind='person') on
+        # "how much did Gautam Singh pay me" and drops the name; the answer it
+        # then narrates is one row plucked from a sample. Convert it.
+        if tool == "rank_counterparties" and not args.get("merchant"):
+            named = extract_merchant(state["message"], agent.vocabulary)
+            if named and any(v["name"] == named and v["kind"] == config.KIND_PERSON
+                             for v in agent.vocabulary):
+                tool = "get_spend"
+                args["merchant"] = named
+                args.pop("kind", None)
+                out["tool"] = tool
+                out["trace"] = [{"step": "reroute", "from": "rank_counterparties",
+                                 "to": "get_spend", "reason": f"names {named}"}]
         if inherited:
             out["trace"] = [{"step": "inherit_context",
                              "from_previous_turn": inherited}]
@@ -151,22 +223,100 @@ def build_graph(agent, checkpointer=None):
 
     def balances(state: TurnState) -> dict:
         message = state["message"]
+        # "other accounts", "account details", "all my accounts" all mean the
+        # full list, not just the primary. The old pattern missed "details".
         all_accounts = bool(re.search(
             r"\b(all|every|each|other|total|combined|across)\b.{0,20}\baccounts?\b|"
-            r"\baccounts?\b.{0,20}\b(all|each|list)\b", message or "", re.I))
+            r"\baccounts?\b.{0,20}\b(all|each|list|details?|info(?:rmation)?|summary)\b|"
+            r"\bother account", message or "", re.I))
         r = queries.get_balances(agent.con, agent.entity_id,
                                  account_id=agent.session.account_id,
                                  all_accounts=all_accounts)
         answer, method = explainer.generate(message, "balances", r)
+        sc = _sc(state)
+        sc["result"] = r
+        sc["confidence"] = Confidence(
+            1.0, HIGH, ["Balance read directly from the account record"])
         return {
-            "status": ANSWER, "answer": answer, "result": r,
+            "status": ANSWER, "answer": answer,
             "result_kind": "balances", "narration": method,
-            "confidence": Confidence(
-                1.0, HIGH, ["Balance read directly from the account record"]),
             "trace": [{"step": "query", "tool": "get_balances",
                        "sql": r.display_sql(), "rows": len(r.rows),
                        "ms": r.latency_ms, "source": r.source,
                        "account": "all" if all_accounts else "primary"}],
+        }
+
+    def generated_sql(state: TurnState) -> dict:
+        """
+        The long-tail fallback: model-written SQL, sandboxed by sqlguard.
+
+        Nothing here trusts the model. The views are scoped server-side, the
+        statement is parsed before it runs, literals are bound, the result is
+        capped, and the answer is banded down and labelled -- so a misread
+        question surfaces as a visibly lower-confidence answer with the query
+        in the audit trace, not as a confident wrong number.
+        """
+        args = state["args"]
+        sql, params = args.get("sql") or "", list(args.get("params") or [])
+        purpose = args.get("purpose") or ""
+        message = state["message"]
+
+        # Generated SQL must not be a way around entity resolution. Any name
+        # the model used as a filter goes through the same resolver the typed
+        # tools use, and gets the same guardrail or clarification.
+        sql, params, cp_status, cp_res, cp_name = agent._sql_counterparty_guard(
+            message, sql, params)
+        if cp_status == resolver.NOT_FOUND:
+            near = (f" The closest names on record are "
+                    f"{', '.join(cp_res.candidates[:3])}." if cp_res and cp_res.candidates else "")
+            sc = _sc(state)
+            sc["resolution"] = cp_res
+            sc["confidence"] = Confidence(1.0, HIGH,
+                                          [f"'{cp_name}' is not present in this "
+                                           f"customer's transaction history"])
+            return {"status": GUARDRAIL,
+                    "answer": f"I have no transactions for **{_as_typed(message, cp_name)}**.{near}",
+                    "trace": [{"step": "generated_sql", "sql": sql, "params": params,
+                               "counterparty_guard": "NOT_FOUND", "name": cp_name}]}
+        if cp_status == resolver.AMBIGUOUS:
+            _sc(state)["resolution"] = cp_res
+            return {"status": CLARIFY, "question": resolver.describe(cp_res),
+                    "options": cp_res.candidates,
+                    "pending_out": {"slot": "merchant", "tool": "get_spend",
+                                    "direction": config.TXN_DEBIT},
+                    "trace": [{"step": "generated_sql", "sql": sql, "params": params,
+                               "counterparty_guard": "AMBIGUOUS", "name": cp_name}]}
+
+        try:
+            r = sqlguard.run(agent.con, agent.entity_id, sql, params, purpose=purpose)
+        except sqlguard.SQLRejected as e:
+            # Refused, not executed. Tell the user plainly; do not fall back to
+            # a different tool silently, which would answer a different
+            # question than the one they asked.
+            _sc(state)["confidence"] = Confidence(
+                1.0, HIGH, ["Generated SQL was refused by the sandbox and never executed"])
+            return {"status": GUARDRAIL,
+                    "answer": ("I couldn't safely run a query for that. "
+                               f"{e} Try rephrasing, or ask about spend, "
+                               "transactions, balances or comparisons."),
+                    "trace": [{"step": "generated_sql", "sql": sql,
+                               "params": params, "rejected": str(e)}]}
+
+        answer, method = explainer.generate(state["message"], "sql", r)
+        conf = agent._confidence(None, None, True, r, method, via_sql=True)
+        sc = _sc(state)
+        sc["result"], sc["confidence"] = r, conf
+        return {
+            "status": ANSWER, "answer": answer, "result_kind": "sql",
+            "narration": method,
+            "pending_out": {"direction": None},
+            "trace": [{"step": "generated_sql", "purpose": purpose,
+                       "sql": r.display_sql(), "rows": len(r.rows),
+                       "ms": r.latency_ms, "source": r.source,
+                       "capped": r.truncated},
+                      {"step": "narrate", "method": method},
+                      {"step": "confidence", "score": conf.score,
+                       "label": conf.label, "reasons": conf.reasons}],
         }
 
     # ---------------------------------------------------- entity resolution
@@ -186,7 +336,9 @@ def build_graph(agent, checkpointer=None):
         raw_merchant = args.get("merchant")
         kind = args.get("kind")
         out = {"direction": direction, "kind": kind, "canonical": None,
-               "resolution": None, "raw_merchant": raw_merchant, "trace": []}
+               "raw_merchant": raw_merchant, "trace": []}
+        sc = _sc(state)
+        sc["resolution"] = None
 
         if not raw_merchant:
             return out
@@ -206,11 +358,12 @@ def build_graph(agent, checkpointer=None):
             out["trace"].append({"step": "resolve_person", "status": p.status,
                                  "candidates": p.candidates})
             if p.status == resolver.AMBIGUOUS:
+                sc["resolution"] = p
                 out.update({
                     "status": CLARIFY,
                     "question": "Which person did you mean? These people have "
                                 "sent you money:",
-                    "options": p.candidates, "resolution": p,
+                    "options": p.candidates,
                     "pending_out": {"slot": "merchant", "tool": tool,
                                     "direction": config.TXN_CREDIT,
                                     "period": args.get("period")}})
@@ -225,7 +378,8 @@ def build_graph(agent, checkpointer=None):
                              "resolved": canonical,
                              "confidence": res.confidence if res else None,
                              "method": res.method if res else None})
-        out["canonical"], out["resolution"] = canonical, res
+        out["canonical"] = canonical
+        sc["resolution"] = res
 
         if res and res.status == resolver.AMBIGUOUS:
             out.update({"status": CLARIFY, "question": resolver.describe(res),
@@ -238,11 +392,21 @@ def build_graph(agent, checkpointer=None):
                     f"{', '.join(res.candidates[:3])}." if res.candidates else "")
             out.update({
                 "status": GUARDRAIL,
-                "answer": f"I have no transactions for **{raw_merchant}**.{near}",
-                "confidence": Confidence(
-                    1.0, HIGH,
-                    [f"'{raw_merchant}' is not present in this customer's "
-                     f"transaction history"])})
+                # Without a model the rules planner can only see counterparties.
+                # A question about a day, a count or a category lands here
+                # looking like an unknown vendor; say what would fix it.
+                # Quote the USER's wording, not the model's argument: the schema
+                # doc tells the model to uppercase names, so echoing the arg
+                # turns "Oracle" into "ORACLE" in the reply.
+                "answer": (f"I have no transactions for **{_as_typed(message, raw_merchant)}**.{near}"
+                           + ("" if llm.is_configured() else
+                              " If you meant something other than a vendor — a "
+                              "day, a count, a category — that needs the language "
+                              "model, which is not configured right now."))})
+            sc["confidence"] = Confidence(
+                1.0, HIGH,
+                [f"'{raw_merchant}' is not present in this customer's "
+                 f"transaction history"])
         return out
 
     def gate_person(state: TurnState) -> dict:
@@ -305,14 +469,17 @@ def build_graph(agent, checkpointer=None):
                 return _unresolved(tr_a, tool, args)
 
         direction, canonical = state["direction"], state.get("canonical")
-        res = state.get("resolution")
+        sc = _sc(state)
+        res = sc.get("resolution")
         r = queries.compare_periods(agent.con, agent.entity_id, direction,
                                     tr_a, tr_b, merchant=canonical)
         answer, method = explainer.generate(state["message"], "compare", r, res)
+        sc["result"] = r
+        sc["time_range"] = tr_b
+        sc["confidence"] = agent._confidence(res, tr_b, True, r, method)
         return {
-            "status": ANSWER, "answer": answer, "result": r,
+            "status": ANSWER, "answer": answer,
             "result_kind": "compare", "narration": method,
-            "confidence": agent._confidence(res, tr_b, True, r, method),
             "pending_out": {"merchant": canonical,
                             "period_token": tr_b.canonical,
                             "direction": direction},
@@ -331,16 +498,23 @@ def build_graph(agent, checkpointer=None):
         if tr.status == UNRESOLVED:
             return _unresolved(tr, tool, args)
 
-        gate = agent._gate_period(state.get("canonical"), period_token, tr, explicit)
+        gate = agent._gate_period(state.get("canonical"), period_token, tr, explicit,
+                                  message=state["message"], args=args, tool=tool)
         if gate is not None:
             gate.pending.update({"tool": tool, "direction": state["direction"]})
             return {"status": CLARIFY, "question": gate.question,
                     "options": gate.options, "pending_out": gate.pending,
-                    "resolution": state.get("resolution"),
                     "trace": [{"step": "policy_gate", "gate": "period_required",
                                "merchant": state.get("canonical")}]}
 
-        return {"time_range": tr, "explicit_period": explicit,
+        # A bounded listing ("latest", "highest", "over 1 lakh", "last 5") is
+        # correctly answered over all history; that is its scope, not an
+        # assumption we made -- so confidence must not dock it for "no period".
+        if not explicit and agent._is_bounded_listing(state["message"], args, tool):
+            explicit = True
+
+        _sc(state)["time_range"] = tr
+        return {"explicit_period": explicit,
                 "period_token": period_token,
                 "trace": [{"step": "resolve_period", "input": period_token,
                            "status": tr.status,
@@ -351,7 +525,8 @@ def build_graph(agent, checkpointer=None):
     # ------------------------------------------------------------- execute
 
     def execute(state: TurnState) -> dict:
-        tool, args, tr = state["tool"], state["args"], state["time_range"]
+        tool, args = state["tool"], state["args"]
+        tr = _sc(state)["time_range"]
         direction, canonical = state["direction"], state.get("canonical")
         kind = state.get("kind")
 
@@ -361,16 +536,37 @@ def build_graph(agent, checkpointer=None):
                                            kind=kind)
             k = "rank"
         elif tool == "list_transactions":
-            r = queries.list_transactions(agent.con, agent.entity_id, direction, tr,
-                                          merchant=canonical, kind=kind,
-                                          limit=int(args.get("limit") or 50))
+            order_by = args.get("order_by") if args.get("order_by") in ("date", "amount") else "date"
+            r = queries.list_transactions(
+                agent.con, agent.entity_id, direction, tr,
+                merchant=canonical, kind=kind,
+                limit=int(args.get("limit") or 50),
+                order_by=order_by,
+                ascending=bool(args.get("ascending", False)),
+                min_amount=args.get("min_amount"),
+                max_amount=args.get("max_amount"))
             k = "list"
         else:
             r = queries.query_spend(agent.con, agent.entity_id, direction, tr,
-                                    merchant=canonical, kind=kind)
+                                    merchant=canonical, kind=kind,
+                                    group_by_month=bool(args.get("group_by_month", False)))
             k = "spend"
 
-        return {"result": r, "result_kind": k,
+        # Without a model, the rules planner cannot express filters like
+        # "on weekends" or "via UPI" and silently answers the un-filtered
+        # question. "Found 20,381 transactions" in reply to "how many on
+        # weekends" is a WRONG answer, not degraded phrasing -- so say plainly
+        # what was ignored instead of letting the number stand unqualified.
+        if state.get("planner") == "rules" and not llm.is_configured():
+            ignored = _UNEXPRESSIBLE.findall(state["message"] or "")
+            if ignored:
+                r.notes.append(
+                    "Filters like " + ", ".join(f"'{w}'" for w in dict.fromkeys(ignored))
+                    + " need the language model, which is not configured; this "
+                      "answer does NOT apply them.")
+
+        _sc(state)["result"] = r
+        return {"result_kind": k,
                 "trace": [{"step": "query", "tool": tool, "sql": r.display_sql(),
                            "rows": len(r.rows), "ms": r.latency_ms,
                            "source": r.source,
@@ -378,11 +574,13 @@ def build_graph(agent, checkpointer=None):
                            "truncated": r.truncated}]}
 
     def narrate(state: TurnState) -> dict:
-        r, res, tr = state["result"], state.get("resolution"), state["time_range"]
+        sc = _sc(state)
+        r, res, tr = sc["result"], sc.get("resolution"), sc["time_range"]
         answer, method = explainer.generate(
             state["message"], state["result_kind"], r, res)
         conf = agent._confidence(res, tr, state.get("explicit_period", False),
                                  r, method)
+        sc["confidence"] = conf
 
         # Everything a follow-up may need to inherit.
         ctx = {"direction": state["direction"]}
@@ -394,7 +592,7 @@ def build_graph(agent, checkpointer=None):
             ctx["period_token"] = tr.canonical
 
         return {"status": ANSWER, "answer": answer, "narration": method,
-                "confidence": conf, "pending_out": ctx,
+                "pending_out": ctx,
                 "trace": [{"step": "narrate", "method": method},
                           {"step": "confidence", "score": conf.score,
                            "label": conf.label, "reasons": conf.reasons}]}
@@ -415,6 +613,11 @@ def build_graph(agent, checkpointer=None):
             return "ask_user"
         if tool == "get_balances":
             return "balances"
+        if tool == "query_sql":
+            # Skips entity/period resolution and the policy gates on purpose:
+            # the sandbox is the guardrail for this path, and the model's SQL
+            # already expresses whatever scope the question had.
+            return "generated_sql"
         return "resolve_entity"
 
     def route_period(state: TurnState):
@@ -424,7 +627,8 @@ def build_graph(agent, checkpointer=None):
 
     g = StateGraph(TurnState)
     for name, fn in [("plan", plan), ("inherit", inherit), ("ask_user", ask_user),
-                     ("balances", balances), ("resolve_entity", resolve_entity),
+                     ("balances", balances), ("generated_sql", generated_sql),
+                     ("resolve_entity", resolve_entity),
                      ("gate_person", gate_person), ("compare", compare),
                      ("resolve_period", resolve_period), ("execute", execute),
                      ("narrate", narrate)]:
@@ -434,9 +638,11 @@ def build_graph(agent, checkpointer=None):
     g.add_conditional_edges("plan", stop_or("inherit"), {"inherit": "inherit", END: END})
     g.add_conditional_edges("inherit", route_tool,
                             {"ask_user": "ask_user", "balances": "balances",
+                             "generated_sql": "generated_sql",
                              "resolve_entity": "resolve_entity", END: END})
     g.add_edge("ask_user", END)
     g.add_edge("balances", END)
+    g.add_edge("generated_sql", END)
     g.add_conditional_edges("resolve_entity", stop_or("gate_person"),
                             {"gate_person": "gate_person", END: END})
     g.add_conditional_edges("gate_person", route_period,

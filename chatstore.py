@@ -268,13 +268,19 @@ class ChatStore:
         Sharing the connection keeps thread deletion atomic: the transcript and
         the graph checkpoints for a thread go in one transaction.
 
-        `pickle_fallback` is required because the turn state carries a
-        QueryResult (which holds a pandas DataFrame) between the execute and
-        narrate nodes, and msgpack cannot encode it. The alternative -- keeping
-        rich objects out of the state behind a side-channel -- is tidier and
-        would keep checkpoints smaller, but it is a restructuring of every node
-        for a file that is local-only and measured in tens of KB per turn.
-        Noted as a cleanup, not a correctness issue.
+        The graph state is plain JSON types only. Rich objects (QueryResult,
+        Resolution, TimeRange, Confidence) live in agent._scratch[run_id] for
+        the duration of a turn and never reach the checkpointer. That was not
+        always so: they used to ride in state under `pickle_fallback`, and the
+        first time Streamlit hot-reloaded queries.py every turn failed with
+        "Can't pickle QueryResult: it's not the same object as
+        queries.QueryResult" -- pickle resolves classes by import path, and a
+        reloaded module is a different class object. Keeping state primitive
+        makes checkpoints msgpack-native and immune to that.
+
+        `pickle_fallback` stays on as belt-and-braces for anything unexpected,
+        but nothing in the designed state should need it; test_warehouse.py
+        asserts that no checkpoint row is pickle-typed.
         """
         from langgraph.checkpoint.sqlite import SqliteSaver
         from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer

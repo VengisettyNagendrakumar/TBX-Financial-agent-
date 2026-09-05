@@ -873,6 +873,44 @@ explicitly scopes to "a well-scoped subset (spend, payouts, reconciliation)",
 and an assistant that answers eight things correctly beats one that answers
 thirty unreliably in a domain where a wrong number is a liability.
 
+#### 14.2.1 The sandboxed SQL fallback — and why it does not reverse the decision
+
+Live testing surfaced a long tail the eight typed tools could not express:
+"which transaction is more than one lakh", "how many transactions on weekends",
+"on which month was my expense highest". The first instinct — add a tool per
+shape — does not scale. The second — let the model write SQL — is exactly what
+§14.2 rejects. The resolution is a **fallback, not a default**, with every
+§14.2 objection answered structurally rather than by prompt:
+
+| §14.2 objection | How the fallback answers it |
+|---|---|
+| Tenancy must not depend on the model | The model can only name two views, `my_transactions` and `my_accounts`, created **per request** with `WHERE entity_id = <session>` baked into their definition. The validator refuses any other table name. There is no SQL the model can write that reads another customer's rows. |
+| Model output is the query | Literals travel as bound `?` parameters. The SQL text is parsed by DuckDB's own parser (`json_serialize_sql`) **without executing**; anything other than exactly one `SELECT` over the two views is refused — including table functions such as `read_parquet`. |
+| Unbounded cost | A `LIMIT` of 200 is enforced on every query. |
+| Verifiability | The query is shown in the audit trace; numeric verification of the narration still applies. |
+| PII | `utr_number` and raw `account_number` are simply not columns of the views; `description` is redacted in results. The model sees the schema, never rows. |
+
+Two further guarantees were added because the sandbox alone left them open:
+
+- **Entity resolution cannot be bypassed.** A name the model filters on —
+  as a parameter *or* an inlined literal — goes through the same resolver the
+  typed tools use. `Oracle` yields the standard *"no such vendor"* guardrail,
+  `selection` asks which of three, `swiggy` is substituted with its canonical.
+  Without this, `WHERE merchant = 'ORACLE'` would return zero rows and be
+  narrated as "you spent nothing" — a false statement with no false *number*,
+  which numeric verification cannot catch.
+- **The band goes down and says why.** The sandbox guarantees scope and safety;
+  it cannot guarantee the model understood the question, because no typed
+  contract constrained the mapping. Answers produced this way carry a
+  `VIA_SQL_FACTOR` and a reason pointing at the query.
+
+The typed tools remain primary: the prompt directs the model to them whenever
+one fits, and several of the reported failures were in fact fixed by
+*extending* them (`order_by`, `min_amount`, `group_by_month`, calendar years,
+"first/last N") rather than by SQL. The fallback exists for the shapes that
+remain. The rules planner — no model — cannot use it, and labels un-appliable
+filters honestly rather than answering a different question.
+
 ---
 
 ### 14.3 Decision 2 — why a graph
