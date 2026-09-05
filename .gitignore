@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 .system_generated/
 myenv/
-
+~$*
 
 # V2 warehouse artefacts
 *.duckdb

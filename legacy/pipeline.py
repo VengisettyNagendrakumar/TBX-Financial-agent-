@@ -79,6 +79,12 @@ class FinanceAssistantPipeline:
         params = query_info.get("params", [])
         display_sql = query_info.get("display_sql", sql)
 
+# {
+#     "sql": "SELECT * FROM vendors WHERE vendor_name = %s AND date >= %s",
+#     "params": ["Amazon", "2026-09-01"],
+#     "display_sql": "SELECT * FROM vendors WHERE vendor_name = 'Amazon' AND date >= '2026-09-01'"
+# }
+
         # 4. DuckDB Analytical Execution (Parameterized)
         try:
             df = self.con.execute(sql, params).df()
