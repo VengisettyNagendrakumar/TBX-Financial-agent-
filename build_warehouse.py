@@ -37,8 +37,14 @@ def _fmt(n):
     return f"{n:,}"
 
 
-def full_build(source: str = "files", data_dir: str = None, verbose: bool = True) -> dict:
-    """Builds the warehouse from scratch, replacing any existing one."""
+def full_build(source: str = "files", data_dir: str = None, verbose: bool = True,
+               loader=None) -> dict:
+    """
+    Builds the warehouse from scratch, replacing any existing one.
+
+    `loader(con, since=None)` overrides the built-in file/MySQL loaders so a
+    live URL (see ingest.py) reuses this pipeline rather than duplicating it.
+    """
     started = time.perf_counter()
     if os.path.exists(config.WAREHOUSE_PATH):
         os.remove(config.WAREHOUSE_PATH)
@@ -50,7 +56,8 @@ def full_build(source: str = "files", data_dir: str = None, verbose: bool = True
         print("=" * 66)
 
     t0 = time.perf_counter()
-    counts = (db.load_from_mysql(con) if source == "mysql"
+    counts = (loader(con) if loader is not None
+              else db.load_from_mysql(con) if source == "mysql"
               else db.load_from_files(con, data_dir))
     load_s = time.perf_counter() - t0
     if verbose:
@@ -94,7 +101,8 @@ def full_build(source: str = "files", data_dir: str = None, verbose: bool = True
     return stats
 
 
-def incremental_build(source: str = "files", data_dir: str = None, verbose: bool = True) -> dict:
+def incremental_build(source: str = "files", data_dir: str = None,
+                      verbose: bool = True, loader=None) -> dict:
     """
     Appends new transactions, re-maps merchants, rebuilds the rollup.
 
@@ -110,7 +118,8 @@ def incremental_build(source: str = "files", data_dir: str = None, verbose: bool
     if not os.path.exists(config.WAREHOUSE_PATH):
         if verbose:
             print("No warehouse found; falling back to a full build.")
-        return full_build(source=source, data_dir=data_dir, verbose=verbose)
+        return full_build(source=source, data_dir=data_dir, verbose=verbose,
+                          loader=loader)
 
     con = db.connect()
     manifest = db.read_manifest(con)
@@ -127,14 +136,16 @@ def incremental_build(source: str = "files", data_dir: str = None, verbose: bool
             if verbose:
                 print("Schema fingerprint changed -> full rebuild required.")
             con.close()
-            return full_build(source=source, data_dir=data_dir, verbose=verbose)
+            return full_build(source=source, data_dir=data_dir, verbose=verbose,
+                              loader=loader)
         if int(manifest.get("alias_map_version", 0)) != config.ALIAS_MAP_VERSION:
             if verbose:
                 print(f"Alias map v{manifest.get('alias_map_version')} -> "
                       f"v{config.ALIAS_MAP_VERSION}: historical answers change, "
                       f"so re-mapping every row -> full rebuild.")
             con.close()
-            return full_build(source=source, data_dir=data_dir, verbose=verbose)
+            return full_build(source=source, data_dir=data_dir, verbose=verbose,
+                              loader=loader)
 
     watermark = manifest["watermark"] if manifest is not None else None
     since = None
@@ -145,7 +156,9 @@ def incremental_build(source: str = "files", data_dir: str = None, verbose: bool
               f"(re-scanning {config.INGEST_LOOKBACK_DAYS}d back from {since})")
 
     t0 = time.perf_counter()
-    if source == "mysql":
+    if loader is not None:
+        loader(con, since=since)
+    elif source == "mysql":
         db.load_from_mysql(con, since=since)
     else:
         db.load_from_files(con, data_dir)
