@@ -208,11 +208,16 @@ def render(msg, key):
             for step in msg["trace"]:
                 s = step.get("step")
                 if s == "plan":
-                    st.markdown(f"**1. Plan** — planner `{step['planner']}` → "
-                                f"tool `{step['tool']}`")
-                    st.json(step["args"], expanded=False)
+                    planner = step.get("planner", "planner")
+                    tool = step.get("tool")
+                    if tool and tool != "clarify" and step.get("resolved") is not False:
+                        st.markdown(f"**1. Plan** — planner `{planner}` → tool `{tool}`")
+                        if "args" in step and step.get("args") is not None:
+                            st.json(step["args"], expanded=False)
+                    else:
+                        st.markdown(f"**1. Plan** — planner `{planner}` (unresolved)")
                 elif s == "resolve_merchant":
-                    st.markdown(f"**Resolve counterparty** — `{step['input']}` → "
+                    st.markdown(f"**Resolve counterparty** — `{step.get('input', '')}` → "
                                 f"**{step.get('resolved')}** "
                                 f"({step.get('status')}, {step.get('method')}, "
                                 f"confidence {step.get('confidence')})")

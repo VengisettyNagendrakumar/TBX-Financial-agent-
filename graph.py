@@ -99,16 +99,17 @@ def build_graph(agent):
         message, pending = state["message"], state.get("pending_in") or {}
 
         # Resuming a clarification: fill the missing slot from this reply.
-        if pending.get("slot"):
+        if pending.get("slot") and pending.get("slot") in ("period", "merchant", "account"):
             merged = agent._resume(message, pending)
             if merged is None:
                 # The reply did not answer the question -- ask again rather
                 # than guessing at what they meant.
                 return {"status": CLARIFY,
-                        "question": pending.get("question", "Which period?"),
+                        "question": pending.get("question", "Could you clarify?"),
                         "options": pending.get("options", []),
                         "pending_out": pending,
                         "trace": [{"step": "plan", "planner": "resume",
+                                   "tool": "clarify", "args": {},
                                    "resolved": False}]}
             tool, args = merged
             return {"tool": tool, "args": args, "planner": "resume",
@@ -144,7 +145,8 @@ def build_graph(agent):
         return {"status": CLARIFY,
                 "question": args.get("question", "Could you clarify?"),
                 "options": args.get("options", []),
-                "pending_out": {"slot": "period", "tool": "get_spend"},
+                "pending_out": {"slot": "general", "tool": "ask_user",
+                                "question": args.get("question")},
                 "trace": [{"step": "ask_user", "source": "planner"}]}
 
     def balances(state: TurnState) -> dict:
