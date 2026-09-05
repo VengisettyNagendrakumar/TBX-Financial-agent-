@@ -84,9 +84,9 @@ anomalies) is built on it exactly as before.
                         └──────────────┬───────────────┘
                                        │
                         ┌──────────────▼───────────────┐
-                        │      AGENT (tool loop)       │
+                        │   AGENT (LangGraph DAG)      │
                         │  ≤20B model, function calls  │
-                        │  max 6 iterations            │
+                        │  1 model decision per turn   │
                         └──────────────┬───────────────┘
                                        │ typed tool args (never SQL)
    ┌──────────┬──────────┬─────────────┼───────────┬────────────┬──────────┐
@@ -382,12 +382,44 @@ Agent: Which one? I see credits from [Gautam Singh ₹12,400]
        [Paresh Vikrant Ghase ₹9,241] [Someone else]
 ```
 
-### 7.3 Loop control
+### 7.3 Control flow — a graph, not a loop
 
-Max 6 iterations, then force a final answer. Every tool call is recorded with
-its arguments, SQL, params, row count and latency, and rendered in the existing
-audit drawer — the explainability requirement now covers the agent's *reasoning
-path*, which is strictly better than V1's single SQL statement.
+Implemented as a **LangGraph state machine** ([graph.py](graph.py)); the
+reasoning behind that choice is [§14](#14-agent-framework-custom-vs-langchain-vs-langgraph).
+
+The turn is a DAG, not an iteration. The model contributes **exactly one
+decision** — which tool, with which arguments — and every edge after that is
+code:
+
+```
+plan ─▶ inherit ─┬─▶ ask_user ──────────────────────────▶ CLARIFY
+                 ├─▶ balances ──────────────────────────▶ ANSWER
+                 └─▶ resolve_entity ─┬─────────────────▶ CLARIFY / GUARDRAIL
+                                     ▼
+                               gate_person ────────────▶ CLARIFY
+                                     │
+                  ┌──────────────────┴──────────┐
+                  ▼                             ▼
+              compare ─▶ ANSWER         resolve_period ─▶ CLARIFY
+                                                │
+                                                ▼
+                                            execute ─▶ narrate ─▶ ANSWER
+```
+
+Two model calls per turn: one to plan, one to narrate. There is no iteration
+budget to exhaust, so turn latency is bounded by construction rather than by a
+cap — see [§5](#5-latency-plan), where the model is the entire budget and the
+database is ~5ms of it.
+
+Five of the nine nodes can terminate the turn. That is why the structure is a
+graph: the guardrails *are* the control flow, and conditional edges state them
+where a chain would bury them.
+
+Every node appends to an additive `trace` in the graph state — its arguments,
+SQL, params, row count and latency — which the audit drawer renders. The
+explainability requirement therefore covers the agent's whole decision path, not
+just the final SQL, and the trace falls out of the topology instead of being
+maintained by hand.
 
 ### 7.4 Model
 
@@ -624,3 +656,393 @@ partial filters) are stored in the session alongside the pending intent. The
 user's reply **resumes** that state rather than restarting, so
 `resolve_merchant` does not run twice and the conversation does not lose the
 merchant it already pinned down.
+
+---
+
+## 13. Confidence scoring
+
+Implemented in `FinanceAgent._confidence` ([agent.py](agent.py)); rendered as a
+band with an expandable reason list in [app.py](app.py).
+
+### 13.1 What confidence does and does not mean
+
+**It is not a probability that the number is right.** Every figure is computed
+by SQL, and [explainer.py](explainer.py) discards any model wording containing a
+figure the database did not return. Arithmetic error is not a failure mode this
+system has.
+
+What genuinely varies is whether the **question was interpreted the way the
+user meant it**:
+
+| Interpretation risk | Example |
+|---|---|
+| Wrong counterparty | "swigy" → SWIGGY, or one of three "SELECTION …" merchants |
+| Assumed window | No period given, so the answer covers two years |
+| Incomplete attribution | 6% of narration in range is unparseable, so per-merchant figures exclude it |
+| Unstable narration | The model emitted an unverifiable figure and was overridden |
+
+So the band answers: *"how likely is it that this answers the question you
+actually asked?"* — not *"how likely is this arithmetic to be correct?"*
+
+### 13.2 Why bands rather than a percentage
+
+An earlier build displayed "93% · High". That was withdrawn: the score is a
+combination of heuristics, not a measurement, and a two-significant-figure
+number invites the reader to treat it as one — to wonder what changed between
+91% and 93% when nothing meaningful did. Three bands carry the actionable
+distinction and nothing more:
+
+| Band | Score | Means | What to do |
+|---|---|---|---|
+| **High** | ≥ 0.88 | Interpreted unambiguously | Use it |
+| **Medium** | 0.72 – 0.88 | One or more details were assumed | Skim the *Interpreted as* line |
+| **Low** | < 0.72 | Several assumptions compounded | Verify before relying on it |
+
+The numeric score is retained internally for logs and tests (`Confidence.pct`)
+but is never displayed.
+
+### 13.3 The four signals
+
+Each signal produces a factor in `[0, 1]`. The factors are **multiplied**:
+
+```
+score = resolution × period × attribution × narration
+```
+
+Multiplication rather than "worst signal wins" is deliberate. A fuzzy-matched
+counterparty over an assumed window with patchy attribution should not read as
+confidently as any one of those problems alone — mild doubts must compound.
+
+**1 · Counterparty resolution** — the resolver's own confidence, taken directly.
+
+| How the name matched | Factor | Reason shown |
+|---|---|---|
+| Exact canonical name | 1.00 | *Matched 'SWIGGY' exactly* |
+| Brand/legal alias (`BUNDL TECHNOLOGIES`) | 0.98 | *Matched 'SWIGGY' by alias …* |
+| Acronym | 0.96 | *… by acronym …* |
+| Whole-word containment (`apollo` → `APOLLO PHARMACY`) | 0.95 | *… by contained …* |
+| Substring | 0.92 | *… by substring …* |
+| Fuzzy / typo (`swigy`) | its score, 0.88–0.92 | *… by fuzzy rather than an exact name* |
+| No counterparty in the question | 1.00 | — |
+
+Ambiguous and not-found names never reach scoring — they become a clarifying
+question or a guardrail instead.
+
+**2 · Period assumption**
+
+| Situation | Factor | Reason shown |
+|---|---|---|
+| Explicit window ("last month", "in April") | 1.00 | *Period resolved to May 2026* |
+| User explicitly said "total" / "all time" | 1.00 | *Answered over all available history, as asked* |
+| **No period mentioned at all** | **0.92** | *No time period given — answered over all available history* |
+
+The distinction matters: asking for a total is a stated intent; saying nothing
+means the system chose a two-year window on the user's behalf.
+
+**3 · Data attribution** — `1.0 − unattributed_share`, where the share is the
+proportion of in-scope transactions whose counterparty could not be parsed from
+the narration (`merchant_norm = 'UNKNOWN'`), computed over the same entity,
+direction and window as the answer. Applied only above 2%, to avoid noise.
+
+> Reason shown: *"6% of transactions in this window have no identifiable
+> counterparty and cannot be attributed to a merchant"*
+
+This is the confidence-layer expression of the coverage measurement from §4.2 —
+the ~6% of narration that is genuinely opaque (`TRF/27964914/15335598`) is
+disclosed rather than silently excluded.
+
+**4 · Narration integrity**
+
+| Situation | Factor | Reason shown |
+|---|---|---|
+| Model wording passed verification | 1.00 | — |
+| Model wording **rejected** | **0.85** | *The model produced a figure the database did not return; its wording was discarded and a verified summary used* |
+
+The displayed number is still correct — the deterministic template replaced the
+prose. The penalty reflects that the model was behaving unreliably on this turn,
+which is weak evidence it also mis-framed something unverifiable.
+
+### 13.4 What is deliberately *not* penalised
+
+**Truncation.** Showing 10 of 40 counterparties does not reduce confidence,
+because the reported total covers all 40 — the answer is complete, only the
+table is capped. It *is* surfaced as a reason, since a reader who assumes the
+table is the whole story would misread it:
+
+> *Showing 10 of 40 rows — the total covers all of them*
+
+**Result size.** A window with few transactions is not less trustworthy; it is
+a smaller number, exactly computed.
+
+**Model vs rules planner.** Both emit the same validated tool arguments, and the
+rules planner is arguably the more predictable of the two. Which one ran is in
+the audit trace, not the confidence.
+
+### 13.5 Fixed-confidence paths
+
+Two answers bypass scoring because there is nothing to interpret:
+
+- **Balances** — read straight from the account record. Always High: *"Balance
+  read directly from the account record"*.
+- **Not-found guardrails** — "I have no transactions for Oracle" is a confident
+  statement of absence, not a low-confidence answer. Always High.
+
+### 13.6 Worked examples
+
+| Question | Factors | Score | Band |
+|---|---|---|---|
+| "How much on Swiggy last month?" | 1.00 × 1.00 × 0.93 | 0.93 | **High** |
+| "Which vendor have I spent most on?" | 1.00 × 0.92 × 0.94 | 0.87 | **Medium** |
+| "How much on swigy last month?" (typo) | 0.91 × 1.00 × 0.93 | 0.85 | **Medium** |
+| "How much on swigy?" (typo, no period) | 0.85 × 0.92 × 0.90 | 0.70 | **Low** |
+| "What's my balance?" | fixed | 1.00 | **High** |
+
+### 13.7 Limitations
+
+- The weights are **calibrated by judgement, not fitted to data**. There is no
+  labelled set of correct-vs-misinterpreted answers to fit against; building one
+  is the honest next step.
+- The bands are **ordinal, not calibrated** — "High" does not assert a 90%
+  success rate.
+- Attribution share is measured over the whole window, not per counterparty, so
+  it is a property of the data rather than of this specific answer.
+- Confidence covers **interpretation only**. It says nothing about whether the
+  underlying source data is complete or correct.
+
+---
+
+---
+
+## 14. Agent framework: custom vs LangChain vs LangGraph
+
+**Decision: a LangGraph state machine over a closed set of typed tools, with a
+single model-authored decision per turn.**
+
+Orchestration lives in [graph.py](graph.py); the domain logic it calls
+(resolution, gates, confidence) stays in [agent.py](agent.py). All **153 tests
+passed unchanged on the first run** after the swap, which is the evidence that
+the migration was behaviour-preserving rather than a rewrite.
+
+This section records why, in enough detail to defend under questioning.
+
+---
+
+### 14.1 The two decisions
+
+They are separable, and conflating them is the usual source of confusion:
+
+1. **How does the model touch the database?** → *Tool calls with typed
+   arguments*, not generated SQL.
+2. **What drives control flow between steps?** → *An explicit graph*, not a
+   model-driven loop and not implicit control flow.
+
+Different constraints motivate each.
+
+---
+
+### 14.2 Decision 1 — tool calls, not text-to-SQL
+
+The obvious alternative is letting the model write SQL against the schema. We
+rejected it on four grounds, three of which are hard requirements rather than
+preferences.
+
+| | Text-to-SQL | Typed tool calls (chosen) |
+|---|---|---|
+| **Tenancy** | Model must be trusted to include `WHERE entity_id = …` | `entity_id` injected server-side; unforgeable |
+| **Injection** | Model output *is* the query | Model picks a tool; args bound as `?` parameters |
+| **Cost ceiling** | Model can emit a cross join over 4M rows | Query shapes are fixed and benchmarked |
+| **Verifiability** | Must validate arbitrary SQL to trust it | Finite, individually tested surface |
+| **Recovery** | Syntax/semantic errors need a repair loop | Invalid args rejected before execution |
+
+The tenancy point is the decisive one. §6.4 states the invariant: **the model
+chooses what to filter, never whose data to read.** With generated SQL that
+invariant can only be enforced by parsing and rewriting the model's output —
+you are then validating a Turing-complete language on the security boundary. A
+tool signature makes it structural: `entity_id` is not a parameter the model can
+express.
+
+The cost argument matters at our scale specifically. §5 shows the rollup path is
+0.8ms and the fact-table fallback 2.0ms *because our code chooses the store
+based on month-alignment*. A model authoring SQL would not reliably make that
+routing choice, and an unconstrained query over 4M rows is unbounded in a way a
+sub-second budget cannot absorb.
+
+The residual cost of tool calling is expressiveness: we can only answer
+questions someone has built a tool for. That is an accepted trade — the brief
+explicitly scopes to "a well-scoped subset (spend, payouts, reconciliation)",
+and an assistant that answers eight things correctly beats one that answers
+thirty unreliably in a domain where a wrong number is a liability.
+
+---
+
+### 14.3 Decision 2 — why a graph
+
+**The shape of the problem is a graph, not a chain.** Five of the nine nodes can
+end the turn:
+
+| Exit | Trigger | Why it must be guaranteed |
+|---|---|---|
+| `CLARIFY` | counterparty matches several names | Silently picking one invents a number |
+| `CLARIFY` | "my friend" — one unnamed person | Totalling everyone answers a different question |
+| `CLARIFY` | period given but unparseable | Dropping it silently widens scope (BUGS.md B01) |
+| `CLARIFY` | no period, counterparty spans months | The brief's own worked example |
+| `GUARDRAIL` | counterparty absent from history | Hallucination guardrail is a Must-Have |
+
+A chain models "A then B then C". This is "A, then *maybe stop*, then B, then
+*maybe stop*". Conditional edges say that directly; the guardrails are the part
+of this system that most needs to be legible, because they are what stops a
+confident wrong answer reaching a finance user.
+
+---
+
+### 14.4 Why not LangChain's agent runtime
+
+`AgentExecutor` / `create_react_agent` run a **ReAct loop**: the model observes,
+decides the next action, and decides when to stop. Four problems here, in
+descending order of severity.
+
+**1. Policy gates become unenforceable.** Our hard requirement is that certain
+conditions *always* produce a clarifying question. In a ReAct loop the decision
+to ask is the model's. You can prompt for it; you cannot guarantee it. We have
+direct evidence this matters: while testing the "my friend" gate, the planner
+chose `get_spend` on one turn and `rank_counterparties` on another for the same
+question. Because the gate ran *outside* the model's control, both were caught.
+Under a ReAct loop that variance would have surfaced as an occasionally-wrong
+answer — the worst failure mode, because it is intermittent.
+
+**2. Latency is unbounded.** A ReAct loop is typically 3–6 model round trips.
+Ours is exactly two: one to choose a tool, one to narrate. At ~300ms each
+(§5) that is the difference between a ~0.7s turn and a 2–4s turn, against a
+sub-second target. The database work is ~5ms; the model is the entire budget,
+so the number of calls *is* the latency design.
+
+**3. Cost is unbounded per turn.** Relevant under a capped token allowance —
+and we exhausted a 200k/day Groq quota during development.
+
+**4. Testability.** Node functions are directly callable. Loop-internal
+behaviour has to be tested by running the loop and asserting on outcomes, which
+makes failures harder to localise.
+
+**A ReAct loop is the right choice when the task requires open-ended
+exploration** — unknown numbers of steps, tool outputs that determine the next
+tool. Our turn has a known shape. Paying for a loop we do not need would buy
+non-determinism.
+
+---
+
+### 14.5 Why not LCEL chains
+
+LangChain's expression language composes linear pipelines well. Ours branches
+five ways and accumulates state (`canonical`, `time_range`, `resolution`,
+`trace`) that later nodes read. `RunnableBranch` can express branching, but
+nested branches obscure exactly the structure we want visible, and LCEL has no
+first-class notion of *pausing a run and resuming it later* — which is precisely
+the clarify/answer cycle.
+
+---
+
+### 14.6 Why not stay custom
+
+The honest position: **the custom loop worked.** It passed the same 153 tests.
+This was not a bug fix, and it should not be defended as one.
+
+What the graph buys:
+
+| Property | Custom | LangGraph |
+|---|---|---|
+| Routing rules | Re-derived at each `return`, inside a 160-line function | Declared once, in one place |
+| Adding a guardrail | Find the right point among nested returns | Add a node + an edge |
+| Testing a step | Run a whole turn | Call the node |
+| Pause / resume | Hand-rolled `pending` dict | Checkpoint + interrupt (standard) |
+| Showing the design | Prose description | `graph.ascii_diagram()` renders the real topology |
+| Audit trace | Manual `trace.append` bookkeeping | One entry per node, structurally |
+
+The clarify/resume cycle is the strongest case. We solved it by hand: serialise
+a `pending` dict, stash it in `session_state`, reconstruct arguments on the next
+turn. That is a re-implementation of checkpoint-and-interrupt, and ours is the
+weaker version — it dies on page refresh (§14.9).
+
+**Migration cost was low precisely because the domain logic was already
+extracted into helpers.** The nodes are thin wrappers. Had the logic been inline
+in the loop, this would have been a rewrite, and the honest recommendation would
+have been to leave it alone.
+
+---
+
+### 14.7 What LangGraph we deliberately do not use
+
+Stating this pre-empts the obvious objection — *"you pulled in a framework and
+used 10% of it"* — which is true and intentional.
+
+- **`create_react_agent`** — the prebuilt ReAct agent. Not used, for §14.4.
+- **Multi-agent / supervisor patterns.** One agent, one domain. Multiple agents
+  would add coordination failure modes and latency for no capability.
+- **Cyclic edges.** Our graph is a DAG. Cycles are how a ReAct loop is built;
+  we do not want one.
+- **`langchain-core` abstractions.** It arrives as a transitive dependency, but
+  no chain, model wrapper, memory, retriever or output parser is used. Groq is
+  called directly with its own SDK.
+
+So the model contributes **exactly one decision per turn**: which tool, with
+which arguments. Every edge after that is code. That is the property that makes
+the guardrails guarantees rather than tendencies.
+
+---
+
+### 14.8 Costs we accept
+
+| Cost | Assessment |
+|---|---|
+| `langgraph` + `langchain-core` dependency | Real. Justified by checkpointing and the routing structure; both are pure-Python and stable. |
+| TypedDict state boilerplate | ~40 lines. Buys type-checkable state instead of ad-hoc locals. |
+| Framework churn risk | LangGraph's API has moved historically. Mitigated: our surface is `StateGraph`, `add_node`, `add_conditional_edges`, `compile`, `invoke` — the stable core — and domain logic is outside it, so a rewrite of `graph.py` would not touch the rules. |
+| Indirection for readers | A reader must follow node → helper. Mitigated by the topology comment at the top of `graph.py`. |
+
+---
+
+### 14.9 Not yet taken up
+
+Available, unused, and worth naming so the dependency is honestly accounted for:
+
+- **Checkpointer** — clarification state still lives in Streamlit
+  `session_state`, which is why history is lost on page refresh. A checkpointer
+  persists it and makes resume durable. Phase 5.
+- **Streaming** — nodes could emit progress ("resolving counterparty…",
+  "querying…") instead of one spinner.
+- **`interrupt()`** — would express the clarification pause natively rather than
+  via terminal state plus a `pending` dict.
+- **LangSmith tracing** — would subsume the hand-built trace, though ours is
+  deliberately user-facing, not a developer tool.
+
+---
+
+### 14.10 When we would choose differently
+
+Judgement is easier to trust when it names its own limits:
+
+- **Open-ended research questions** ("find anything unusual in my spending") →
+  a ReAct loop, because the number of steps genuinely is not known ahead.
+- **A schema too large to wrap in tools** (hundreds of tables, arbitrary
+  analytics) → text-to-SQL with a validation layer, accepting the cost.
+- **A prototype with no guardrail requirements** → stay custom; the framework
+  would not pay for itself.
+- **Many specialised domains** (tax, investments, lending) → multi-agent
+  supervision, where coordination cost buys real separation.
+
+None describes this system: a fixed schema, a bounded question set, and hard
+requirements on clarification and grounding.
+
+---
+
+### 14.11 One-paragraph defence
+
+> The finance domain makes wrong answers liabilities, so the brief requires
+> guardrails and clarifying questions. A guarantee cannot be delegated to a
+> model's judgement, so control flow must be code, not a ReAct loop — which also
+> keeps us at two model calls per turn inside a sub-second budget. Tool calls
+> rather than generated SQL make tenancy scoping structural instead of prompted,
+> and bound the cost of any single query at 4M rows. LangGraph expresses that
+> control flow as nodes and conditional edges, which matters because five of
+> nine nodes are early exits — the guardrails *are* the structure. We use the
+> graph and nothing else from the ecosystem: the model contributes exactly one
+> decision per turn, and every edge after it is code.

@@ -203,6 +203,62 @@ class TimeRange:
         return s.day == 1 and e == last_of_end_month
 
 
+def previous_window(tr: TimeRange) -> TimeRange:
+    """
+    The equal-length window immediately before `tr`.
+
+    "Compare the last 3 months to the 3 months before that" needs Jan-Mar when
+    the subject is Apr-Jun. Naming that window is awkward -- `previous_3_months`
+    reads as a synonym of `last_3_months` and resolves to the same range -- so
+    it is derived from the window being compared rather than parsed from words.
+    That makes every phrasing of "the period before" work without enumerating
+    them: "the 3 months before", "the previous period", "the same period last
+    time".
+
+    Month-aligned windows shift by whole calendar months so quarter-on-quarter
+    comparisons stay on month boundaries (and on the fast rollup path). Other
+    windows shift by their exact length in days.
+    """
+    if tr is None or tr.status != RESOLVED or not tr.start or not tr.end:
+        return TimeRange(status=UNRESOLVED, label="the preceding period",
+                         suggestions=_SUGGESTIONS)
+
+    s = datetime.strptime(tr.start, "%Y-%m-%d").date()
+    e = datetime.strptime(tr.end, "%Y-%m-%d").date()
+
+    if tr.month_aligned:
+        months = (e.year - s.year) * 12 + (e.month - s.month) + 1
+        prev_start = s - relativedelta(months=months)
+        prev_end = s - relativedelta(days=1)
+        if months == 1:
+            label = f"{prev_start:%B %Y}"
+        else:
+            label = (f"the {months} calendar months before that "
+                     f"({prev_start:%b %Y} - {prev_end:%b %Y})")
+        canonical = f"preceding_{months}_months"
+    else:
+        days = (e - s).days + 1
+        prev_end = s - relativedelta(days=1)
+        prev_start = prev_end - relativedelta(days=days - 1)
+        label = f"the {days} days before that ({prev_start} to {prev_end})"
+        canonical = f"preceding_{days}_days"
+
+    return TimeRange(status=RESOLVED,
+                     start=prev_start.strftime("%Y-%m-%d"),
+                     end=prev_end.strftime("%Y-%m-%d"),
+                     label=label, canonical=canonical)
+
+
+def same_window(a: TimeRange, b: TimeRange) -> bool:
+    """True when two ranges cover exactly the same dates."""
+    if a is None or b is None:
+        return False
+    if a.status == ALL_TIME and b.status == ALL_TIME:
+        return True
+    return (a.status == b.status == RESOLVED
+            and a.start == b.start and a.end == b.end)
+
+
 # Canonical vocabulary. Aliases exist because the LLM is *prompted* with an enum
 # but not *constrained* to it -- response_format=json_object guarantees syntax,
 # not schema. Unknown values must land on UNRESOLVED, never on "no filter".

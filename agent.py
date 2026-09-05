@@ -42,7 +42,24 @@ CLARIFY = "CLARIFY"
 GUARDRAIL = "GUARDRAIL"
 ERROR = "ERROR"
 
-MAX_ITERATIONS = 4
+
+# Confidence bands. See ARCHITECTURE_V2.md §13 for the full methodology.
+HIGH, MEDIUM, LOW = "High", "Medium", "Low"
+BAND_HIGH_MIN = 0.88
+BAND_MEDIUM_MIN = 0.72
+
+# Per-signal factors, multiplied together. Multiplicative rather than "worst
+# wins" so that several mild doubts compound into a real one -- a fuzzy-matched
+# counterparty over an assumed period with patchy attribution should not read
+# as confidently as any one of those alone.
+PERIOD_ASSUMED_FACTOR = 0.92      # no period given; answered over all history
+NARRATION_REJECTED_FACTOR = 0.85  # model wording failed the grounding check
+
+
+def band_for(score: float) -> str:
+    if score >= BAND_HIGH_MIN:
+        return HIGH
+    return MEDIUM if score >= BAND_MEDIUM_MIN else LOW
 
 
 @dataclass
@@ -50,18 +67,23 @@ class Confidence:
     """
     How much to trust this answer.
 
-    The arithmetic is always exact -- it comes from SQL. What varies is whether
-    the question was interpreted correctly: did we pick the right counterparty,
-    the right window, and is the underlying data fully attributed. Those are the
-    things this scores, and each one is reported with its reason so the number
-    is inspectable rather than decorative.
+    The arithmetic is always exact -- it comes from SQL, and a figure the
+    database did not produce cannot reach the user. What varies is whether the
+    QUESTION was interpreted correctly: the right counterparty, the right
+    window, over data that is fully attributed.
+
+    Only the band is shown. The underlying score is a means of combining
+    signals, not a measurement anyone should read to two significant figures,
+    and displaying "93%" invites exactly that. Every contributing signal is
+    surfaced as a plain-language reason instead.
     """
     score: float = 1.0
-    label: str = "High"
+    label: str = HIGH
     reasons: list = field(default_factory=list)
 
     @property
     def pct(self) -> int:
+        """Internal only -- for logs and tests, never for display."""
         return int(round(self.score * 100))
 
 
@@ -124,10 +146,21 @@ TOOLS = [
                        "'how does that compare to last month', 'is that more than before'.",
         "parameters": {"type": "object", "properties": {
             "merchant": {"type": "string"},
-            "period_a": {"type": "string", "description": "Earlier period. " + PERIOD_DESC},
-            "period_b": {"type": "string", "description": "Later period. " + PERIOD_DESC},
+            "period_b": {"type": "string",
+                         "description": "The period the user is ASKING ABOUT. " + PERIOD_DESC},
+            "period_a": {"type": "string",
+                         "description": "The baseline to compare against, ONLY if the "
+                                        "user named a specific one (e.g. 'versus "
+                                        "April'). OMIT this for 'the period before', "
+                                        "'the 3 months before that', 'the previous "
+                                        "quarter' -- the system derives the "
+                                        "equal-length window immediately before "
+                                        "period_b. " + PERIOD_DESC},
             "direction": {"type": "string", "enum": ["debit", "credit"]},
-        }, "required": ["period_a", "period_b", "direction"]}}},
+        # period_a is intentionally NOT required. Marking it required made Groq
+        # reject the model's (correct) omission with a schema-validation error,
+        # silently dropping every comparison onto the rules planner.
+        }, "required": ["period_b", "direction"]}}},
 
     {"type": "function", "function": {
         "name": "list_transactions",
@@ -167,6 +200,11 @@ Guidance:
 - "which vendor/merchant did I spend most on" -> rank_counterparties
 - "what was my last/latest/most recent transaction" -> list_transactions with
   limit 5, no merchant and no period
+- Comparisons -> compare_spend. Put the window the user is ASKING ABOUT in
+  'period_b'. If the baseline is "the period before", "the 3 months before
+  that", or similar, OMIT 'period_a' entirely -- the system derives the
+  equal-length window immediately before 'period_b'. Never put a time phrase in
+  'merchant'.
 - "my friend paid me" -> rank_counterparties(direction='credit', kind='person')
 - "total" / "overall" / "ever" / "all time" -> period='all_time'
 - If the user names no time period and is asking about one counterparty, still
@@ -270,6 +308,50 @@ def extract_direction(text: str, default: str = config.TXN_DEBIT):
     return explicit_direction(text) or default
 
 
+# A phrase that describes time, not a counterparty. "compare it to the 3 months
+# before" put "the 3 months before" through the resolver, which answered
+# "I have no transactions for the three months before" -- a time expression
+# reported as a missing vendor.
+_PERIOD_WORDS = re.compile(
+    r"\b(month|months|week|weeks|year|years|quarter|quarters|day|days|"
+    r"period|periods|ago|earlier|before|previous|prior|preceding|last|past|"
+    r"trailing|since|recent|yesterday|today|ytd|mtd|qtd|q[1-4])\b", re.I)
+
+_MONTH_WORD = re.compile(
+    r"\b(january|february|march|april|may|june|july|august|september|"
+    r"october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b",
+    re.I)
+
+
+# Carry no meaning of their own in "the three months before that".
+_PERIOD_FILLER = {"the", "a", "an", "that", "this", "it", "of", "in", "for",
+                  "to", "those", "these", "my", "same", "and", "then"}
+_NUMBER_WORDS = {"one", "two", "three", "four", "five", "six", "seven", "eight",
+                 "nine", "ten", "eleven", "twelve", "couple", "few"}
+
+
+def looks_like_period(text: str) -> bool:
+    """
+    True when a string is a time expression rather than a counterparty name.
+
+    Checked before entity resolution: fuzzy-matching "the 3 months before"
+    against a merchant list can only produce a wrong vendor or a misleading
+    "I have no transactions for the three months before".
+
+    Structural rather than a keyword count -- strip filler and numbers, then
+    require EVERY remaining word to be temporal. "Last Mile Logistics" contains
+    a time word but keeps 'mile' and 'logistics', so it stays a merchant.
+    """
+    if not text:
+        return False
+    words = [w.lower() for w in re.findall(r"[A-Za-z0-9]+", str(text))]
+    core = [w for w in words
+            if w not in _PERIOD_FILLER and w not in _NUMBER_WORDS and not w.isdigit()]
+    if not core:
+        return False  # only filler/numbers -- not enough to call it a period
+    return all(_PERIOD_WORDS.fullmatch(w) or _MONTH_WORD.fullmatch(w) for w in core)
+
+
 def extract_merchant(text: str, vocabulary: list):
     """
     Finds a known counterparty in the question.
@@ -294,9 +376,13 @@ def extract_merchant(text: str, vocabulary: list):
                   text or "", re.I)
     if m:
         cand = m.group(1).strip()
-        if cand.lower() not in {"me", "my", "it", "that", "them", "total", "all",
-                                "the most", "most", "everything"}:
-            return cand
+        if cand.lower() in {"me", "my", "it", "that", "them", "total", "all",
+                            "the most", "most", "everything"}:
+            return None
+        # "compare it to the 3 months before" -- the object of "to" is a period.
+        if looks_like_period(cand):
+            return None
+        return cand
     return None
 
 
@@ -317,6 +403,10 @@ class FinanceAgent:
         self.vocabulary = resolver.load_vocabulary(con, self.entity_id)
         self._people = [v["name"] for v in self.vocabulary
                         if v["kind"] == config.KIND_PERSON]
+
+        # Compiled once; the topology is static, only the state varies.
+        from graph import build_graph
+        self._graph = build_graph(self)
 
     # ---------- planning ----------
 
@@ -365,9 +455,13 @@ class FinanceAgent:
         if re.search(r"\b(compare|versus|vs\.?|difference between)\b", low) or \
            re.search(r"\bhow (?:does|did) (?:that|this|it) compare\b", low):
             prev = self._last_context(history)
+            # period_a is left unset on purpose: the baseline is derived as the
+            # equal-length window immediately before period_b. Hardcoding it
+            # (it used to be "two_months_ago") compared a 3-month subject
+            # against a single month.
             return "compare_spend", {
                 "merchant": merchant or prev.get("merchant"),
-                "period_a": "two_months_ago", "period_b": period or "last_month",
+                "period_b": period or prev.get("period_token") or "last_month",
                 "direction": direction,
             }
 
@@ -481,43 +575,66 @@ class FinanceAgent:
         return inherited
 
     def _confidence(self, resolution, tr, explicit_period, result, narration) -> Confidence:
-        """Composite of interpretation risks. The arithmetic itself is exact."""
+        """
+        Composite of interpretation risk. See ARCHITECTURE_V2.md §13.
+
+        Four independent signals, each a factor in [0, 1], multiplied together:
+          1. counterparty resolution  -- the resolver's own confidence
+          2. period assumption        -- did we invent the window
+          3. data attribution         -- share of in-scope rows with no
+                                         identifiable counterparty
+          4. narration integrity      -- did the model's wording survive the
+                                         grounding check
+
+        Truncation is deliberately NOT a penalty: the displayed rows are capped
+        but the reported total covers every row, so the answer is complete. It
+        is still surfaced as a reason, because a reader who assumes the table
+        is the whole story would misread it.
+        """
         score, reasons = 1.0, []
 
+        # 1. Counterparty resolution.
         if resolution is not None and resolution.status == resolver.MATCH:
-            if resolution.confidence < 1.0:
-                score = min(score, max(resolution.confidence, 0.75))
-                reasons.append(
-                    f"'{resolution.entity}' matched by {resolution.method.replace('_', ' ')} "
-                    f"({int(resolution.confidence * 100)}%)")
+            if resolution.confidence >= 1.0:
+                reasons.append(f"Matched '{resolution.entity}' exactly")
             else:
-                reasons.append(f"Exact match on '{resolution.entity}'")
+                score *= resolution.confidence
+                reasons.append(
+                    f"Matched '{resolution.entity}' by "
+                    f"{resolution.method.replace('_', ' ')} rather than an exact name")
 
+        # 2. Period assumption. Saying "total" counts as explicit; saying
+        #    nothing at all means we chose the window on the user's behalf.
         if tr is not None and tr.status == ALL_TIME and not explicit_period:
-            score = min(score, 0.9)
-            reasons.append("No period given — answered over all available history")
+            score *= PERIOD_ASSUMED_FACTOR
+            reasons.append("No time period given — answered over all available history")
         elif tr is not None and tr.status == RESOLVED:
             reasons.append(f"Period resolved to {tr.label}")
+        elif tr is not None and tr.status == ALL_TIME:
+            reasons.append("Answered over all available history, as asked")
 
+        # 3. Data attribution.
         if result is not None:
-            filters = result.filters or {}
-            unattributed = self._unattributed_share(filters.get("direction"), tr)
+            unattributed = self._unattributed_share(
+                (result.filters or {}).get("direction"), tr)
             if unattributed > 0.02:
-                score = min(score, 1.0 - min(unattributed, 0.25))
+                score *= (1.0 - unattributed)
                 reasons.append(
-                    f"{unattributed:.0%} of transactions in range have no identifiable "
-                    f"counterparty and are excluded from per-merchant figures")
+                    f"{unattributed:.0%} of transactions in this window have no "
+                    f"identifiable counterparty and cannot be attributed to a merchant")
             if result.truncated:
                 reasons.append(
-                    f"Displaying {len(result.rows)} of {result.total_group_count} rows "
-                    f"(the total covers all of them)")
+                    f"Showing {len(result.rows)} of {result.total_group_count} rows — "
+                    f"the total covers all of them")
 
+        # 4. Narration integrity.
         if narration == "llm_rejected":
-            reasons.append("Model wording was discarded for an unverifiable figure; "
-                           "a database-generated summary was used")
+            score *= NARRATION_REJECTED_FACTOR
+            reasons.append("The model produced a figure the database did not return; "
+                           "its wording was discarded and a verified summary used")
 
-        label = "High" if score >= 0.9 else ("Moderate" if score >= 0.75 else "Low")
-        return Confidence(score=round(score, 2), label=label, reasons=reasons)
+        score = round(max(0.0, min(1.0, score)), 3)
+        return Confidence(score=score, label=band_for(score), reasons=reasons)
 
     def _unattributed_share(self, direction, tr) -> float:
         """Share of in-scope transactions whose counterparty could not be parsed."""
@@ -621,55 +738,46 @@ class FinanceAgent:
     # ---------- execution ----------
 
     def run(self, message: str, history: list = None, pending: dict = None) -> AgentResult:
+        """
+        Runs one turn through the LangGraph state machine.
+
+        The public contract is unchanged from the hand-rolled version: same
+        arguments, same AgentResult. Only orchestration moved.
+        """
         t0 = time.perf_counter()
-        history = history or []
-        trace = []
-
-        # Resuming a clarification: fill the missing slot from this reply.
-        if pending and pending.get("slot"):
-            merged = self._resume(message, pending)
-            if merged is None:
-                return AgentResult(
-                    status=CLARIFY, question=pending.get("question", "Which period?"),
-                    options=pending.get("options", []), pending=pending,
-                    latency_ms=round((time.perf_counter() - t0) * 1000, 2))
-            tool, args = merged
-            planner = "resume"
-        else:
-            plan = self._plan_llm(message, history)
-            planner = "llm"
-            if plan is None:
-                plan = self._plan_rules(message, history)
-                planner = "rules"
-            tool, args = plan
-
-        trace.append({"step": "plan", "planner": planner, "tool": tool, "args": dict(args)})
-
-        inherited = {}
-        if planner != "resume":
-            inherited = self._inherit_context(message, tool, args, history)
-            if inherited:
-                trace.append({"step": "inherit_context", "from_previous_turn": inherited})
-
+        state = {"message": message, "history": history or [],
+                 "pending_in": pending or {}, "trace": []}
         try:
-            out = self._execute(message, tool, args, trace)
+            final = self._graph.invoke(state)
         except UnresolvedFilterError as e:
-            out = AgentResult(
-                status=CLARIFY,
-                question=f"I couldn't work out the time period **'{e.value}'**. "
-                         f"Which period did you mean?",
-                options=["Last month", "Last 3 months", "This year", "All time"],
-                pending={"slot": "period", **{k: v for k, v in args.items() if k != "period"},
-                         "tool": tool},
-            )
+            final = {
+                "status": CLARIFY,
+                "question": f"I couldn't work out the time period "
+                            f"**'{e.value}'**. Which period did you mean?",
+                "options": ["Last month", "Last 3 months", "This year", "All time"],
+                "pending_out": {"slot": "period"},
+                "trace": state["trace"],
+            }
         except Exception as e:
-            out = AgentResult(status=ERROR, answer=f"Something went wrong: {e}")
+            final = {"status": ERROR, "answer": f"Something went wrong: {e}",
+                     "trace": state["trace"]}
 
-        out.trace = trace
-        out.planner = planner
-        out.inherited = inherited
-        out.latency_ms = round((time.perf_counter() - t0) * 1000, 2)
-        return out
+        return AgentResult(
+            status=final.get("status", ERROR),
+            answer=final.get("answer", ""),
+            question=final.get("question", ""),
+            options=final.get("options", []) or [],
+            result=final.get("result"),
+            kind=final.get("result_kind", ""),
+            trace=final.get("trace", []) or [],
+            planner=final.get("planner", ""),
+            narration=final.get("narration", ""),
+            pending=final.get("pending_out", {}) or {},
+            resolution=final.get("resolution"),
+            confidence=final.get("confidence") or Confidence(),
+            inherited=final.get("inherited", {}) or {},
+            latency_ms=round((time.perf_counter() - t0) * 1000, 2),
+        )
 
     def _resume(self, message: str, pending: dict):
         """Turns a reply to a clarifying question back into a tool call."""
@@ -700,166 +808,3 @@ class FinanceAgent:
                     tool = "get_spend"
         args.setdefault("direction", config.TXN_DEBIT)
         return tool, args
-
-    def _execute(self, message, tool, args, trace) -> AgentResult:
-        if tool == "ask_user":
-            return AgentResult(status=CLARIFY,
-                               question=args.get("question", "Could you clarify?"),
-                               options=args.get("options", []),
-                               pending={"slot": "period", "tool": "get_spend"})
-
-        if tool == "get_balances":
-            all_accounts = bool(re.search(
-                r"\b(all|every|each|other|total|combined|across)\b.{0,20}\baccounts?\b|"
-                r"\baccounts?\b.{0,20}\b(all|each|list)\b", message or "", re.I))
-            r = queries.get_balances(self.con, self.entity_id,
-                                     account_id=self.session.account_id,
-                                     all_accounts=all_accounts)
-            trace.append({"step": "query", "tool": tool, "sql": r.display_sql(),
-                          "rows": len(r.rows), "ms": r.latency_ms, "source": r.source,
-                          "account": "all" if all_accounts else "primary"})
-            answer, method = explainer.generate(message, "balances", r)
-            return AgentResult(ANSWER, answer=answer, result=r, kind="balances",
-                               narration=method,
-                               confidence=Confidence(1.0, "High",
-                                                     ["Balance read directly from the account record"]))
-
-        stated = explicit_direction(message)
-        direction = stated or args.get("direction")
-        if tool == "list_transactions" and not stated and not args.get("_direction_inherited"):
-            # "What was my last transaction?" means either direction. Letting a
-            # planner's guess stand here would silently hide an incoming
-            # payment, so only an explicit word narrows a listing.
-            direction = None
-        elif direction not in config.VALID_TXN_TYPES:
-            direction = config.TXN_DEBIT
-
-        # ---- counterparty resolution + guardrails ----
-        raw_merchant = args.get("merchant")
-        kind = args.get("kind")
-        canonical, res = None, None
-
-        if raw_merchant:
-            if str(raw_merchant).strip().lower() in {
-                    "friend", "my friend", "someone", "a friend", "person"}:
-                p = resolver.resolve_person(self.con, self.entity_id, raw_merchant)
-                trace.append({"step": "resolve_person", "status": p.status,
-                              "candidates": p.candidates})
-                if p.status == resolver.AMBIGUOUS:
-                    return AgentResult(
-                        status=CLARIFY,
-                        question="Which person did you mean? These people have sent "
-                                 "you money:",
-                        options=p.candidates,
-                        pending={"slot": "merchant", "tool": tool,
-                                 "direction": config.TXN_CREDIT,
-                                 "period": args.get("period")},
-                        resolution=p)
-                raw_merchant = None
-                kind = config.KIND_PERSON
-            else:
-                canonical, res = self._resolve_merchant(raw_merchant)
-                trace.append({"step": "resolve_merchant", "input": raw_merchant,
-                              "status": res.status if res else None,
-                              "resolved": canonical,
-                              "confidence": res.confidence if res else None,
-                              "method": res.method if res else None})
-                if res and res.status == resolver.AMBIGUOUS:
-                    return AgentResult(
-                        status=CLARIFY, question=resolver.describe(res),
-                        options=res.candidates,
-                        pending={"slot": "merchant", "tool": tool,
-                                 "direction": direction, "period": args.get("period")},
-                        resolution=res)
-                if res and res.status == resolver.NOT_FOUND:
-                    near = (f" The closest names on record are "
-                            f"{', '.join(res.candidates[:3])}." if res.candidates else "")
-                    return AgentResult(
-                        status=GUARDRAIL,
-                        answer=f"I have no transactions for **{raw_merchant}**.{near}",
-                        resolution=res,
-                        confidence=Confidence(
-                            1.0, "High",
-                            [f"'{raw_merchant}' is not present in this customer's "
-                             f"transaction history"]))
-
-        # Policy gate: "how much did MY FRIEND pay me" asks about ONE person.
-        # Totalling every individual answers a different question while reading
-        # as authoritative, so offer the names instead. Checked here so it
-        # applies whichever tool the planner chose.
-        person_gate = self._gate_singular_person(message, args, tool, canonical)
-        if person_gate is not None:
-            trace.append({"step": "policy_gate", "gate": "singular_person"})
-            return person_gate
-
-        # ---- period resolution + gate ----
-        if tool == "compare_spend":
-            tr_a, _ = self._resolve_period(args.get("period_a"))
-            tr_b, _ = self._resolve_period(args.get("period_b"))
-            for tr in (tr_a, tr_b):
-                if tr.status == UNRESOLVED:
-                    raise UnresolvedFilterError("time period", tr.label, tr.suggestions)
-            r = queries.compare_periods(self.con, self.entity_id, direction,
-                                        tr_a, tr_b, merchant=canonical)
-            trace.append({"step": "query", "tool": tool, "sql": r.display_sql(),
-                          "rows": len(r.rows), "ms": r.latency_ms, "source": r.source})
-            answer, method = explainer.generate(message, "compare", r, res)
-            return AgentResult(
-                ANSWER, answer=answer, result=r, kind="compare", narration=method,
-                resolution=res,
-                confidence=self._confidence(res, tr_b, True, r, method),
-                pending={"merchant": canonical, "period_token": args.get("period_b"),
-                         "direction": direction})
-
-        period_token = args.get("period")
-        tr, explicit = self._resolve_period(period_token)
-        if tr.status == UNRESOLVED:
-            raise UnresolvedFilterError("time period", tr.label, tr.suggestions)
-
-        gate = self._gate_period(canonical, period_token, tr, explicit)
-        if gate is not None:
-            gate.pending.update({"tool": tool, "direction": direction})
-            gate.resolution = res
-            trace.append({"step": "policy_gate", "gate": "period_required",
-                          "merchant": canonical})
-            return gate
-
-        trace.append({"step": "resolve_period", "input": period_token,
-                      "status": tr.status, "window": f"{tr.start}..{tr.end}",
-                      "label": tr.label, "month_aligned": tr.month_aligned})
-
-        if tool == "rank_counterparties":
-            r = queries.top_counterparties(self.con, self.entity_id, direction, tr,
-                                           limit=int(args.get("limit") or 10), kind=kind)
-            k = "rank"
-        elif tool == "list_transactions":
-            r = queries.list_transactions(self.con, self.entity_id, direction, tr,
-                                          merchant=canonical, kind=kind,
-                                          limit=int(args.get("limit") or 50))
-            k = "list"
-        else:
-            r = queries.query_spend(self.con, self.entity_id, direction, tr,
-                                    merchant=canonical, kind=kind)
-            k = "spend"
-
-        trace.append({"step": "query", "tool": tool, "sql": r.display_sql(),
-                      "rows": len(r.rows), "ms": r.latency_ms, "source": r.source,
-                      "grand_total": r.facts.get("grand_total"),
-                      "truncated": r.truncated})
-
-        answer, method = explainer.generate(message, k, r, res)
-        trace.append({"step": "narrate", "method": method})
-        conf = self._confidence(res, tr, explicit, r, method)
-        trace.append({"step": "confidence", "score": conf.score, "label": conf.label,
-                      "reasons": conf.reasons})
-        # Everything a follow-up may need to inherit.
-        ctx = {"direction": direction}
-        if canonical:
-            ctx["merchant"] = canonical
-        if period_token:
-            ctx["period_token"] = period_token
-        elif tr.status == RESOLVED and tr.canonical:
-            ctx["period_token"] = tr.canonical
-        return AgentResult(ANSWER, answer=answer, result=r, kind=k,
-                           narration=method, resolution=res,
-                           confidence=conf, pending=ctx)

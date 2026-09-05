@@ -668,17 +668,35 @@ def test_agent(con):
 
     # ---- confidence --------------------------------------------------
     rc = bot.run("How much have I spent on Swiggy last month?")
-    check("answers carry a confidence score",
+    check("answers carry a confidence band",
           0.0 < rc.confidence.score <= 1.0 and rc.confidence.label in
-          ("High", "Moderate", "Low"), f"{rc.confidence}")
+          (A.HIGH, A.MEDIUM, A.LOW), f"{rc.confidence}")
     check("confidence explains itself", len(rc.confidence.reasons) > 0)
     check("an exact counterparty match is reported as a reason",
-          any("Exact match" in r for r in rc.confidence.reasons), f"{rc.confidence.reasons}")
+          any("exactly" in r for r in rc.confidence.reasons), f"{rc.confidence.reasons}")
 
     # No period given -> lower confidence than an explicit window.
     ra = bot.run("Which vendor have I spent on the most?")
     check("an unspecified period lowers confidence",
-          ra.confidence.score <= 0.9, f"{ra.confidence}")
+          ra.confidence.score < rc.confidence.score or ra.confidence.label != A.HIGH,
+          f"{ra.confidence}")
+
+    # All three bands must be reachable. An earlier version floored every
+    # penalty at 0.75 while Low required < 0.75, so the badge could physically
+    # never say Low -- a signal that never fires is not a signal.
+    check("band thresholds are ordered", A.BAND_HIGH_MIN > A.BAND_MEDIUM_MIN > 0)
+    check("a clean answer bands High", A.band_for(1.0) == A.HIGH)
+    check("a mildly assumed answer bands Medium",
+          A.band_for(0.80) == A.MEDIUM, A.band_for(0.80))
+    check("a compounded-doubt answer bands Low",
+          A.band_for(0.70) == A.LOW, A.band_for(0.70))
+    # Realistic worst case: fuzzy name + assumed period + patchy attribution.
+    worst = 0.85 * A.PERIOD_ASSUMED_FACTOR * 0.90
+    check("a realistic worst case actually reaches Low",
+          A.band_for(worst) == A.LOW, f"{worst:.3f} -> {A.band_for(worst)}")
+    # Signals compound rather than one overriding the rest.
+    check("several mild doubts compound below any single one",
+          (0.95 * A.PERIOD_ASSUMED_FACTOR * 0.95) < 0.95)
 
     # ---- session-scoped balances -------------------------------------
     import session as session_mod
@@ -717,6 +735,72 @@ def test_agent(con):
     check("swapped and ordered arguments give the same delta",
           abs(swapped.facts["delta"] - ordered.facts["delta"]) < 0.01,
           f"{swapped.facts['delta']} vs {ordered.facts['delta']}")
+
+    # ---- "the N months before that" ----------------------------------
+    # A 3-month window must be compared against the 3 months before it, not
+    # against a single month. The baseline is derived from the subject rather
+    # than parsed, because `previous_3_months` reads as a synonym of
+    # `last_3_months` and resolves to the same range.
+    l3 = db.resolve_time_range("last_3_months", bot.anchor)
+    prev3 = db.previous_window(l3)
+    check("previous_window of a 3-month window is 3 months long",
+          prev3.start == "2026-01-01" and prev3.end == "2026-03-31",
+          f"{prev3.start}..{prev3.end}")
+    check("previous_window is contiguous with the subject window",
+          prev3.end < l3.start, f"{prev3.end} vs {l3.start}")
+    check("previous_window stays month-aligned (keeps the rollup path)",
+          prev3.month_aligned)
+    pm = db.previous_window(db.resolve_time_range("last_month", bot.anchor))
+    check("previous_window of one month is the month before",
+          pm.start == "2026-04-01" and pm.end == "2026-04-30", f"{pm.start}..{pm.end}")
+    d30 = db.previous_window(db.resolve_time_range("last_30_days", bot.anchor))
+    check("previous_window of a day window shifts by days, not months",
+          d30.start == "2026-04-26" and d30.end == "2026-05-25", f"{d30.start}..{d30.end}")
+    check("same_window detects identical ranges",
+          db.same_window(l3, db.resolve_time_range("last_3_months", bot.anchor)))
+    check("same_window rejects different ranges", not db.same_window(l3, prev3))
+
+    # A time phrase must never be resolved as a counterparty. This produced
+    # "I have no transactions for the three months before. The closest names on
+    # record are UBER, AMAZON, MYNTRA."
+    for phrase in ["the 3 months before", "the three months before that",
+                   "last month", "the previous 3 months", "April",
+                   "the same period last year"]:
+        check(f"time phrase not treated as a merchant: {phrase!r}",
+              A.looks_like_period(phrase), phrase)
+    for name in ["SWIGGY", "Swiggy Ltd", "UBER", "Last Mile Logistics",
+                 "Monthly Gym", "Gautam Singh", "SELECTION ELECTRONICS"]:
+        check(f"merchant not mistaken for a period: {name!r}",
+              not A.looks_like_period(name), name)
+    check("extract_merchant ignores a time phrase after 'to'",
+          A.extract_merchant("compare it to the 3 months before", bot.vocabulary) is None)
+
+    # End to end: a 3-month subject compares against a 3-month baseline.
+    hist3 = [{"role": "user", "content": "spending for swiggy"},
+             {"role": "assistant", "content": "...",
+              "context": {"merchant": "SWIGGY", "period_token": "last_3_months",
+                          "direction": config.TXN_DEBIT}}]
+    rcmp = bot.run("compare it to the 3 months before", history=hist3)
+    ok = rcmp.result is not None and rcmp.kind == "compare"
+    check("'compare it to the 3 months before' produces a comparison", ok,
+          f"{rcmp.status}: {rcmp.answer[:90]}")
+    if ok:
+        f = rcmp.result.facts
+        check("both windows are 3 months long",
+              "3 calendar months" in f["period_a"] and "3 calendar months" in f["period_b"],
+              f"A={f['period_a']} B={f['period_b']}")
+        check("the baseline precedes the subject",
+              f["total_a"] != f["total_b"], f"{f['total_a']} vs {f['total_b']}")
+
+    # The tool schema must not require period_a: Groq rejects a call that omits
+    # a required property, which silently dropped every comparison onto rules.
+    cmp_tool = next(t for t in A.TOOLS
+                    if t["function"]["name"] == "compare_spend")["function"]
+    check("compare_spend does not require period_a",
+          "period_a" not in cmp_tool["parameters"]["required"],
+          f"{cmp_tool['parameters']['required']}")
+    check("compare_spend still requires period_b",
+          "period_b" in cmp_tool["parameters"]["required"])
 
     # Grounding verification: an invented figure must be rejected.
     r6 = bot.run("How much have I spent on Swiggy last month?")

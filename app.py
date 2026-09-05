@@ -43,6 +43,7 @@ st.markdown("""
   .grd { font-size:0.78rem; color:#7d8590; margin-top:6px; }
   .conf { display:inline-block; font-size:0.8rem; padding:3px 10px; border-radius:12px;
       margin:6px 0; border:1px solid; }
+  .conf-sub { opacity:0.75; font-weight:400; }
   .conf-hi { color:#3fb950; border-color:#238636; background:#0f2417; }
   .conf-md { color:#d29922; border-color:#9e6a03; background:#241d0f; }
   .conf-lo { color:#f85149; border-color:#8b2c25; background:#2a1416; }
@@ -151,16 +152,28 @@ def render(msg, key):
 
     conf = msg.get("confidence")
     if conf:
-        cls = {"High": "conf-hi", "Moderate": "conf-md"}.get(conf["label"], "conf-lo")
-        dot = {"High": "●", "Moderate": "◐"}.get(conf["label"], "○")
+        # Band only. A precise-looking percentage invites the reader to treat a
+        # combination of heuristics as a measurement; the band plus the reasons
+        # says what is actually known.
+        cls = {"High": "conf-hi", "Medium": "conf-md"}.get(conf["label"], "conf-lo")
+        dot = {"High": "●", "Medium": "◐"}.get(conf["label"], "○")
+        blurb = {
+            "High": "interpreted unambiguously",
+            "Medium": "one or more details were assumed",
+            "Low": "worth checking the interpretation below",
+        }.get(conf["label"], "")
         st.markdown(
-            f"<div class='conf {cls}'>{dot} Confidence: "
-            f"<strong>{conf['pct']}% · {conf['label']}</strong></div>",
+            f"<div class='conf {cls}'>{dot} <strong>{conf['label']} confidence</strong>"
+            f"<span class='conf-sub'> — {blurb}</span></div>",
             unsafe_allow_html=True)
         if conf.get("reasons"):
-            with st.expander("Why this confidence?"):
+            with st.expander("How was this confidence determined?"):
                 for reason in conf["reasons"]:
                     st.markdown(f"- {reason}")
+                st.caption("Amounts are computed by the database and are exact. "
+                           "Confidence reflects how the question was interpreted — "
+                           "the counterparty, the date window, and how much of the "
+                           "underlying data could be attributed.")
 
     if msg.get("interpretation"):
         st.markdown(f"<div class='interp'>{esc_inline(msg['interpretation'])}</div>",
@@ -224,7 +237,7 @@ def render(msg, key):
             st.caption(f"Turn latency **{meta.get('latency_ms', 0):.0f} ms** · "
                        f"planner **{meta.get('planner')}** · "
                        f"narration **{meta.get('narration')}** · "
-                       f"confidence **{(msg.get('confidence') or {}).get('pct', 100)}%**")
+                       f"confidence **{(msg.get('confidence') or {}).get('label', 'High')}**")
 
     if msg.get("narration") == "llm_rejected":
         st.markdown("<div class='grd'>⚑ The model produced a figure the database "
