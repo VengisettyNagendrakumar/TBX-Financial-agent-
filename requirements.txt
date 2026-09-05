@@ -11,3 +11,4 @@ python-pptx>=1.0.0
 matplotlib>=3.8.0
 fastapi>=0.110.0
 uvicorn>=0.29.0
+requests>=2.31.0

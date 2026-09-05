@@ -15,10 +15,14 @@ Features:
 """
 
 import re
+import os
+import requests
 import streamlit as st
 import pandas as pd
 from pipeline import FinanceAssistantPipeline
 import config
+
+API_URL = os.getenv("API_URL", "http://localhost:8000")
 
 def escape_markdown_currency(text: str) -> str:
     """
@@ -58,6 +62,48 @@ def get_pipeline():
 
 pipeline = get_pipeline()
 
+def check_backend_health():
+    """Checks if the FastAPI server is running on port 8000."""
+    try:
+        r = requests.get(f"{API_URL}/api/health", timeout=0.8)
+        if r.status_code == 200:
+            return True, r.json()
+    except Exception:
+        pass
+    return False, None
+
+def execute_financial_query(user_query: str, chat_history: list) -> dict:
+    """
+    Dispatches query:
+    1. If FastAPI backend is live (http://localhost:8000), sends HTTP POST /api/query.
+    2. If offline, seamlessly executes via local in-memory pipeline.
+    """
+    clean_history = []
+    for m in chat_history:
+        if isinstance(m, dict) and "role" in m and "content" in m:
+            clean_history.append({"role": m["role"], "content": m["content"]})
+
+    api_online, health_data = check_backend_health()
+    if api_online:
+        try:
+            payload = {"query": user_query, "chat_history": clean_history}
+            resp = requests.post(f"{API_URL}/api/query", json=payload, timeout=45.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("table"):
+                    data["table"] = pd.DataFrame(data["table"])
+                else:
+                    data["table"] = None
+                data["backend_source"] = f"FastAPI REST API ({API_URL}/api/query)"
+                return data
+        except Exception:
+            pass  # Fall back to in-process pipeline on network error
+
+    # Direct In-Process Engine
+    data = pipeline.process_query(user_query, chat_history=clean_history)
+    data["backend_source"] = "In-Process DuckDB Engine"
+    return data
+
 # -------------------------------------------------------------
 # SIDEBAR: EVALUATION METRICS & PRE-BUILT DEMO PROMPTS
 # -------------------------------------------------------------
@@ -82,6 +128,15 @@ with st.sidebar:
             st.session_state.trigger_query = q
 
     st.markdown("---")
+    api_online, health_data = check_backend_health()
+    st.subheader("🔌 Backend Architecture")
+    if api_online:
+        st.success("🟢 **FastAPI REST API**: Connected (`:8000`)")
+        st.caption(f"Routing via `POST {API_URL}/api/query`  \nAnchor Date: `{health_data.get('anchor_date')}`")
+    else:
+        st.info("⚡ **Direct Mode**: In-Process Engine")
+        st.caption("Run `py api.py` to route queries over HTTP REST.")
+
     with st.expander("📄 Note on Model Choice (Section 7 Compliant)"):
         st.markdown(f"**Active Model**: `{config.ACTIVE_MODEL}` (Groq)")
         st.markdown("**Section 7 Constraint Compliance**:")
@@ -149,7 +204,8 @@ for msg in st.session_state.messages:
                 conf = msg.get("confidence", 1.0)
                 conf_label = msg.get("confidence_label", "High Certainty")
                 lat = msg.get("latency_ms", 0.0)
-                st.caption(f"Execution Latency: **{lat} ms** | Confidence: **{conf_label} ({int(conf*100)}%)** | Math Engine: **DuckDB (Deterministic)**")
+                src = msg.get("backend_source", "DuckDB Engine")
+                st.caption(f"Execution Latency: **{lat} ms** | Confidence: **{conf_label} ({int(conf*100)}%)** | Backend: **{src}**")
 
 # Handle input (either typed or triggered from sidebar)
 user_prompt = st.chat_input("Ask a question about spend, payouts, or reconciliation...")
@@ -163,10 +219,10 @@ if user_prompt:
     with st.chat_message("user"):
         st.markdown(user_prompt)
 
-    # Process query through pipeline
+    # Process query through backend dispatcher (FastAPI HTTP or In-Process fallback)
     with st.chat_message("assistant"):
         with st.spinner("Querying analytical database..."):
-            result = pipeline.process_query(user_prompt, chat_history=st.session_state.messages)
+            result = execute_financial_query(user_prompt, chat_history=st.session_state.messages)
 
             # 1. Main Answer
             st.markdown(escape_markdown_currency(result["answer"]), unsafe_allow_html=True)
@@ -204,7 +260,8 @@ if user_prompt:
                     conf = result.get("confidence", 1.0)
                     conf_label = result.get("confidence_label", "High Certainty")
                     lat = result.get("latency_ms", 0.0)
-                    st.caption(f"Execution Latency: **{lat} ms** | Confidence: **{conf_label} ({int(conf*100)}%)** | Math Engine: **DuckDB (Deterministic)**")
+                    src = result.get("backend_source", "DuckDB Engine")
+                    st.caption(f"Execution Latency: **{lat} ms** | Confidence: **{conf_label} ({int(conf*100)}%)** | Backend: **{src}**")
 
             # Store in session state
             st.session_state.messages.append({
@@ -216,6 +273,7 @@ if user_prompt:
                 "confidence_label": result.get("confidence_label"),
                 "confidence_desc": result.get("confidence_desc"),
                 "latency_ms": result.get("latency_ms"),
-                "anomalies": result.get("anomalies")
+                "anomalies": result.get("anomalies"),
+                "backend_source": result.get("backend_source")
             })
 
