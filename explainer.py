@@ -24,6 +24,7 @@ import re
 
 import config
 import security
+import llm
 
 # Currency-shaped figures: 1,234.56 / 1234.56 / 12,345
 _NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
@@ -231,13 +232,10 @@ def generate(user_question: str, kind: str, result, resolution=None) -> tuple:
     """
     fallback = template_answer(kind, result, resolution)
 
-    key = os.getenv("GROQ_API_KEY", config.GROQ_API_KEY)
-    if not key:
+    if not llm.is_configured():
         return fallback, "template"
 
     try:
-        from groq import Groq
-
         sample = []
         if result.rows is not None and not result.rows.empty:
             sample = security.redact_records(
@@ -252,15 +250,11 @@ def generate(user_question: str, kind: str, result, resolution=None) -> tuple:
             f"NOTES: {result.notes or 'none'}\n\n"
             f"Currency symbol: {config.CURRENCY_SYMBOL}"
         )
-        resp = Groq(api_key=key).chat.completions.create(
-            model=config.ACTIVE_MODEL,
-            messages=[{"role": "system", "content": SYSTEM},
-                      {"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=300,
-            reasoning_effort="low",
-        )
-        text = resp.choices[0].message.content
+        resp = llm.chat(
+            [{"role": "system", "content": SYSTEM},
+             {"role": "user", "content": prompt}],
+            temperature=0.0, max_tokens=300, reasoning_effort="low")
+        text = llm.message_text(resp)
         text = text.replace(" ", " ").replace("\xa0", " ").strip()
 
         ok, bad = verify_grounding(text, result.facts, result.rows)

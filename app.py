@@ -27,6 +27,7 @@ import db
 import agent as agent_mod
 import explainer
 import session as session_mod
+import llm
 import chatstore
 import pandas as pd
 
@@ -121,9 +122,9 @@ with st.sidebar:
             st.session_state.queued = q
 
     st.divider()
-    llm_on = bool(os.getenv("GROQ_API_KEY", config.GROQ_API_KEY))
+    llm_on = llm.is_configured()
     st.caption(f"Planner: **{'LLM + rules fallback' if llm_on else 'rules only (no API key)'}**")
-    st.caption(f"Model: `{config.ACTIVE_MODEL}`")
+    st.caption(f"Model: `{llm.model()}`" + (f" · {llm.provider_name()}" if llm_on else ""))
 
 # ---------------------------------------------------------------- state
 @st.cache_resource(show_spinner=False)

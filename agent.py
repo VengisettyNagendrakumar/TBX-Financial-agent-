@@ -35,6 +35,7 @@ import db
 import queries
 import resolver
 import explainer
+import llm
 from db import RESOLVED, ALL_TIME, UNRESOLVED
 from queries import UnresolvedFilterError
 
@@ -412,11 +413,9 @@ class FinanceAgent:
     # ---------- planning ----------
 
     def _plan_llm(self, message: str, history: list):
-        key = os.getenv("GROQ_API_KEY", config.GROQ_API_KEY)
-        if not key:
+        if not llm.is_configured():
             return None
         try:
-            from groq import Groq
             msgs = [{"role": "system",
                      "content": SYSTEM_PROMPT.format(anchor=self.anchor)}]
             for h in history[-4:]:
@@ -424,17 +423,14 @@ class FinanceAgent:
                     msgs.append({"role": h["role"], "content": str(h["content"])[:500]})
             msgs.append({"role": "user", "content": message})
 
-            resp = Groq(api_key=key).chat.completions.create(
-                model=config.ACTIVE_MODEL, messages=msgs,
-                tools=TOOLS, tool_choice="auto", temperature=0.0, max_tokens=400,
-                reasoning_effort="low",
-            )
-            calls = resp.choices[0].message.tool_calls
-            if not calls:
+            resp = llm.chat(msgs, tools=TOOLS, tool_choice="auto",
+                            temperature=0.0, max_tokens=400,
+                            reasoning_effort="low")
+            call = llm.first_tool_call(resp)
+            if call is None:
                 return None
-            call = calls[0]
-            args = json.loads(call.function.arguments or "{}")
-            return call.function.name, args
+            name, raw_args = call
+            return name, json.loads(raw_args or "{}")
         except Exception as e:
             print(f"[agent] LLM planning unavailable, using rules: {e}")
             return None

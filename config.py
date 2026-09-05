@@ -220,9 +220,28 @@ ACCOUNT_NUMBER_VISIBLE_SUFFIX = 4
 
 # -------------------------------------------------------------
 # MODEL  (Section 7: <= 20B parameters; must support tool calling)
+#
+# Any OpenAI-compatible endpoint works -- the provider is chosen by base URL,
+# not by code (see llm.py). Switching providers is a .env edit:
+#
+#   Groq    LLM_BASE_URL=https://api.groq.com/openai/v1   (default)
+#   OpenAI  LLM_BASE_URL=                                 (SDK default)
+#   Ollama  LLM_BASE_URL=http://localhost:11434/v1
 # -------------------------------------------------------------
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
+
+# GROQ_API_KEY / GROQ_MODEL remain supported so existing setups keep working.
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-ACTIVE_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+ACTIVE_MODEL = (os.getenv("LLM_MODEL", "") or os.getenv("GROQ_MODEL", "")
+                or "openai/gpt-oss-20b")
+
+# Reasoning models (gpt-5-*, o-series) spend budget on hidden reasoning tokens
+# before emitting a tool call, so they need more headroom than a plain call.
+LLM_REASONING_MIN_TOKENS = int(os.getenv("LLM_REASONING_MIN_TOKENS", "2000"))
+
+LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "30"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "1"))
 
 # Candidates for the model-efficiency benchmark (BUGS.md B16).
 BENCHMARK_MODELS = [

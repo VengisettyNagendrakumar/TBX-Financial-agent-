@@ -33,6 +33,7 @@ import config
 import db
 import session as session_mod
 import agent as agent_mod
+import llm
 
 
 def f(res, key):
@@ -162,12 +163,18 @@ def run(bot, planner_label: str, expect_planner: str = None,
 def main():
     ap = argparse.ArgumentParser(description="Agent interpretation accuracy.")
     ap.add_argument("--planner", choices=["llm", "rules", "both"], default="both")
-    ap.add_argument("--model", help="Override GROQ_MODEL for this run (for B16).")
+    ap.add_argument("--model", help="Model to evaluate (for BUGS.md B16).")
+    ap.add_argument("--base-url", help="Provider endpoint. Omit to use the "
+                                       "configured one; empty string means OpenAI.")
     args = ap.parse_args()
 
     if args.model:
         config.ACTIVE_MODEL = args.model
-        os.environ["GROQ_MODEL"] = args.model
+        os.environ["LLM_MODEL"] = args.model
+    if args.base_url is not None:
+        os.environ["LLM_BASE_URL"] = args.base_url
+        config.LLM_BASE_URL = args.base_url
+    llm.reset()
 
     con = db.connect(read_only=True)
     sess = session_mod.load(con)
@@ -175,15 +182,17 @@ def main():
 
     wanted = ["llm", "rules"] if args.planner == "both" else [args.planner]
     for planner in wanted:
-        key = os.getenv("GROQ_API_KEY", config.GROQ_API_KEY)
-        if planner == "llm" and not key:
-            print("\nSkipping LLM planner: no GROQ_API_KEY.")
+        if planner == "llm" and not llm.is_configured():
+            print("\nSkipping LLM planner: no LLM_API_KEY / GROQ_API_KEY.")
             continue
         if planner == "rules":
+            os.environ["LLM_API_KEY"] = ""
             os.environ["GROQ_API_KEY"] = ""
+            config.LLM_API_KEY = ""
             config.GROQ_API_KEY = ""
+            llm.reset()
 
-        label = (f"LLM ({config.ACTIVE_MODEL})" if planner == "llm"
+        label = (f"LLM ({llm.describe()})" if planner == "llm"
                  else "rules only (no API key)")
         print(f"\n{'=' * 74}\n{label}\n{'=' * 74}")
         bot = agent_mod.FinanceAgent(con, session=sess)

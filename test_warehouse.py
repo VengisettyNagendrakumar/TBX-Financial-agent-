@@ -873,6 +873,92 @@ def test_agent(con):
 
     cstore.close(); reopened.close()
 
+    # ---- provider portability ----------------------------------------
+    # The provider is chosen by base URL, not by code, so switching from Groq
+    # to OpenAI (or a local model) is configuration rather than a rewrite.
+    import llm as LLM
+    GROQ_URL = "https://api.groq.com/openai/v1"
+
+    def _env(**kw):
+        for k in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL",
+                  "GROQ_API_KEY", "GROQ_MODEL", "OPENAI_API_KEY"):
+            os.environ.pop(k, None)
+        os.environ.update({k: v for k, v in kw.items() if v is not None})
+        # config holds whatever the developer's .env set at import time, so it
+        # is pinned here too -- otherwise these assertions pass or fail
+        # depending on whose machine runs them.
+        config.LLM_BASE_URL = kw.get("LLM_BASE_URL", GROQ_URL)
+        config.LLM_API_KEY = kw.get("LLM_API_KEY", "")
+        LLM.reset()
+
+    _env(GROQ_API_KEY="gsk_test")
+    check("legacy GROQ_API_KEY still configures the client", LLM.is_configured())
+    _env(LLM_BASE_URL="", LLM_API_KEY="sk_test", LLM_MODEL="gpt-4o-mini")
+    check("blank base URL selects OpenAI",
+          LLM.provider_name() == "OpenAI" and LLM.model() == "gpt-4o-mini",
+          f"{LLM.provider_name()} {LLM.model()}")
+    _env(LLM_BASE_URL="https://api.groq.com/openai/v1", LLM_API_KEY="k")
+    check("Groq endpoint is recognised", LLM.provider_name() == "Groq")
+    _env(LLM_BASE_URL="http://localhost:11434/v1", LLM_API_KEY="none")
+    check("a local endpoint is recognised", LLM.provider_name() == "local")
+    _env()
+    check("no key means not configured", not LLM.is_configured())
+    _env(LLM_BASE_URL="", OPENAI_API_KEY="sk_openai")
+    check("OPENAI_API_KEY is used when the endpoint is OpenAI", LLM.is_configured())
+    _env(LLM_BASE_URL="https://api.groq.com/openai/v1", OPENAI_API_KEY="sk_openai")
+    check("an OpenAI key is NOT sent to Groq", not LLM.is_configured(),
+          "would surface as a confusing 401")
+
+    # reasoning_effort is the one provider-specific parameter: Groq accepts it
+    # for gpt-oss, OpenAI rejects it on non-reasoning models. A rejection must
+    # be absorbed and remembered, not surfaced as a failed turn.
+    class _FakeCompletions:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kw):
+            self.calls.append(dict(kw))
+            if "reasoning_effort" in kw:
+                raise Exception("400 Unrecognized request argument supplied: "
+                                "reasoning_effort")
+            M = type("M", (), {"content": "ok", "tool_calls": None})
+            C = type("C", (), {"message": M()})
+            return type("R", (), {"choices": [C()]})()
+
+    fake = type("Client", (), {"chat": type("Chat", (), {"completions": _FakeCompletions()})()})()
+    calls = fake.chat.completions.calls
+    real_client = LLM._client
+    LLM._client = lambda: fake
+    LLM._NO_REASONING_EFFORT.clear()
+    try:
+        LLM.chat([{"role": "user", "content": "hi"}],
+                 reasoning_effort="low", model_name="gpt-4o-mini")
+        check("a reasoning_effort rejection is retried without it",
+              len(calls) == 2 and "reasoning_effort" in calls[0]
+              and "reasoning_effort" not in calls[1], f"{len(calls)} calls")
+        check("the rejection is remembered per model",
+              "gpt-4o-mini" in LLM._NO_REASONING_EFFORT)
+        n = len(calls)
+        r = LLM.chat([{"role": "user", "content": "hi"}],
+                     reasoning_effort="low", model_name="gpt-4o-mini")
+        check("no wasted retry on the next call for that model",
+              len(calls) - n == 1 and "reasoning_effort" not in calls[-1])
+        check("response text extraction is provider-agnostic",
+              LLM.message_text(r) == "ok")
+        n = len(calls)
+        LLM.chat([{"role": "user", "content": "hi"}],
+                 reasoning_effort="low", model_name="openai/gpt-oss-20b")
+        check("a different model still attempts reasoning_effort",
+              "reasoning_effort" in calls[n])
+        LLM.chat([{"role": "user", "content": "hi"}],
+                 tools=[{"type": "function"}], model_name="m")
+        check("tools pass through with tool_choice defaulted",
+              "tools" in calls[-1] and calls[-1].get("tool_choice") == "auto")
+    finally:
+        LLM._client = real_client
+        LLM._NO_REASONING_EFFORT.clear()
+        _env(GROQ_API_KEY=os.getenv("GROQ_API_KEY", ""))
+
     # Grounding verification: an invented figure must be rejected.
     r6 = bot.run("How much have I spent on Swiggy last month?")
     if r6.result is not None:
