@@ -154,7 +154,8 @@ def template_answer(kind: str, result, resolution=None) -> str:
         if result.rows.empty:
             return f"No activity found for {period}."
         top = result.rows.iloc[0]
-        lines = [f"Your largest counterparty in {period} was **{top['merchant_norm']}** "
+        adjective = "least" if f.get("rank_order") == "asc" else "largest"
+        lines = [f"Your {adjective} counterparty in {period} was **{top['merchant_norm']}** "
                  f"at **{money(top['total_amount'])}** "
                  f"over {int(top['txn_count'])} transaction(s)."]
         if len(result.rows) > 1:
@@ -165,6 +166,17 @@ def template_answer(kind: str, result, resolution=None) -> str:
         lines.append(f"Total across all **{f.get('group_count', len(result.rows))}** "
                      f"counterparties: **{money(f['grand_total'])}**.")
         return " ".join(lines)
+
+    if kind == "month_rank":
+        if result.rows.empty:
+            return f"No activity found for {period}."
+        top = result.rows.iloc[0]
+        adjective = "lowest" if f.get("rank_order") == "asc" else "highest"
+        direction_word = "expense" if f.get("direction") == config.TXN_DEBIT else "income"
+        month = str(top["month"])[:7]
+        return (f"Your {adjective} {direction_word} month in {period} was "
+                f"**{month}**, with **{money(top['total_amount'])}** across "
+                f"**{int(top['txn_count'])}** transaction(s).")
 
     if kind == "compare":
         d, pct = f.get("delta", 0), f.get("pct_change")
@@ -178,11 +190,23 @@ def template_answer(kind: str, result, resolution=None) -> str:
     if kind == "list":
         if result.rows.empty:
             return f"No transactions found for {period}."
+        if f.get("shown") == 1 and f.get("row_merchant"):
+            labels = {
+                "latest": "latest",
+                "oldest": "first",
+                "amount_desc": "highest amount",
+                "amount_asc": "lowest amount",
+            }
+            label = labels.get(f.get("list_order"), "matching")
+            direction_word = "debit" if f.get("row_direction") == config.TXN_DEBIT else "credit"
+            return (f"Your {label} transaction in {period} was **{money(f['top_amount'])}** "
+                    f"with **{f['row_merchant']}** on **{f['row_date']}** "
+                    f"({direction_word}).")
         shown = ""
         if result.truncated:
             shown = f", showing the most recent {len(result.rows)}"
-        return (f"Found **{f['txn_count']}** transaction(s) totalling "
-                f"**{money(f['grand_total'])}** in {period}{shown}.")
+        return (f"Showing **{f['shown']}** transaction row(s) for {period}{shown}. "
+                f"The full match has **{f['txn_count']}** transaction(s).")
 
     if kind == "balances":
         if result.rows.empty:
@@ -229,6 +253,8 @@ def generate(user_question: str, kind: str, result, resolution=None) -> tuple:
     'template'.
     """
     fallback = template_answer(kind, result, resolution)
+    if kind in {"list", "month_rank"}:
+        return fallback, "template"
 
     key = os.getenv("GROQ_API_KEY", config.GROQ_API_KEY)
     if not key:

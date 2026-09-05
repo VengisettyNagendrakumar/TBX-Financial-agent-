@@ -131,13 +131,27 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "rank_counterparties",
         "description": "Rank counterparties by amount. Use for 'which vendor have I "
-                       "spent the most on', 'who paid me the most', 'top merchants'.",
+                       "spent the most on', 'who paid me the most', 'top merchants', "
+                       "or 'least contributor'.",
         "parameters": {"type": "object", "properties": {
             "direction": {"type": "string", "enum": ["debit", "credit"]},
             "period": {"type": "string", "description": PERIOD_DESC},
             "kind": {"type": "string", "enum": ["merchant", "person"],
                      "description": "Set 'person' when the user asks about individuals (a friend, someone who paid them)."},
             "limit": {"type": "integer", "description": "How many to show. Default 10."},
+            "order": {"type": "string", "enum": ["asc", "desc"],
+                      "description": "Use asc for least/smallest contributor, desc for most/top."},
+        }, "required": ["direction"]}}},
+
+    {"type": "function", "function": {
+        "name": "rank_months",
+        "description": "Rank months by expense or income. Use for 'which month had "
+                       "my highest expense' or 'lowest spending month'.",
+        "parameters": {"type": "object", "properties": {
+            "direction": {"type": "string", "enum": ["debit", "credit"]},
+            "period": {"type": "string", "description": PERIOD_DESC},
+            "limit": {"type": "integer", "description": "How many months to show. Default 1."},
+            "order": {"type": "string", "enum": ["asc", "desc"]},
         }, "required": ["direction"]}}},
 
     {"type": "function", "function": {
@@ -165,12 +179,15 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "list_transactions",
         "description": "Individual transactions. Use for 'show me those', 'list my "
-                       "payments to X'.",
+                       "payments to X', 'latest transaction', 'first transaction', "
+                       "or 'highest transaction'.",
         "parameters": {"type": "object", "properties": {
             "merchant": {"type": "string"},
             "period": {"type": "string", "description": PERIOD_DESC},
             "direction": {"type": "string", "enum": ["debit", "credit"]},
             "limit": {"type": "integer"},
+            "order": {"type": "string",
+                      "enum": ["latest", "oldest", "amount_desc", "amount_asc"]},
         }, "required": []}}},
 
     {"type": "function", "function": {
@@ -198,8 +215,13 @@ Guidance:
 - "spent on X" / "paid X" -> get_spend with direction='debit'
 - "paid me" / "received from" / "sent me" -> direction='credit'
 - "which vendor/merchant did I spend most on" -> rank_counterparties
+- "least contributor" / "smallest contributor" -> rank_counterparties with order='asc'
+- "which month had my highest expense/spend" -> rank_months with direction='debit', limit 1
 - "what was my last/latest/most recent transaction" -> list_transactions with
-  limit 5, no merchant and no period
+  limit 1, order='latest', no merchant and no period
+- "first transaction" -> list_transactions with limit 1 and order='oldest'
+- "highest/largest transaction amount" -> list_transactions with limit 1 and order='amount_desc'
+- "lowest/smallest transaction amount" -> list_transactions with limit 1 and order='amount_asc'
 - Comparisons -> compare_spend. Put the window the user is ASKING ABOUT in
   'period_b'. If the baseline is "the period before", "the 3 months before
   that", or similar, OMIT 'period_a' entirely -- the system derives the
@@ -322,6 +344,8 @@ _MONTH_WORD = re.compile(
     r"october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b",
     re.I)
 
+_TXN_WORD = r"trans(?:ac|ca|c)?tions?"
+
 
 # Carry no meaning of their own in "the three months before that".
 _PERIOD_FILLER = {"the", "a", "an", "that", "this", "it", "of", "in", "for",
@@ -376,8 +400,10 @@ def extract_merchant(text: str, vocabulary: list):
                   text or "", re.I)
     if m:
         cand = m.group(1).strip()
-        if cand.lower() in {"me", "my", "it", "that", "them", "total", "all",
-                            "the most", "most", "everything"}:
+        cand_low = cand.lower()
+        if (cand_low in {"me", "my", "it", "that", "them", "total", "all",
+                         "the most", "most", "everything"}
+                or re.match(r"^(which|what|where|when|who|whom|whose|one)\b", cand_low)):
             return None
         # "compare it to the 3 months before" -- the object of "to" is a period.
         if looks_like_period(cand):
@@ -433,10 +459,56 @@ class FinanceAgent:
                 return None
             call = calls[0]
             args = json.loads(call.function.arguments or "{}")
+            override = self._deterministic_tool_override(message, args, history)
+            if override is not None:
+                return override
             return call.function.name, args
         except Exception as e:
             print(f"[agent] LLM planning unavailable, using rules: {e}")
             return None
+
+    def _deterministic_tool_override(self, message: str, args: dict, history: list):
+        """
+        Hard intent edges that should not depend on model phrasing.
+
+        These are row/rank questions where returning a total is plainly the
+        wrong shape of answer.
+        """
+        low = (message or "").lower()
+        if re.search(rf"\b(first|earliest|oldest)\b[\w\s]{{0,25}}\b{_TXN_WORD}\b", low):
+            return "list_transactions", {
+                "merchant": extract_merchant(message, self.vocabulary),
+                "period": extract_period(message), "limit": 1, "order": "oldest"}
+        if re.search(rf"\b(last|latest|most recent|recent)\b[\w\s]{{0,20}}\b{_TXN_WORD}\b", low):
+            limit_m = re.search(rf"\b(?:last|latest|recent)\s+(\d{{1,3}})\s+{_TXN_WORD}\b", low)
+            return "list_transactions", {
+                "merchant": extract_merchant(message, self.vocabulary),
+                "period": extract_period(message),
+                "limit": int(limit_m.group(1)) if limit_m else 1,
+                "order": "latest"}
+        if (re.search(r"\b(highest|largest|biggest|max(?:imum)?)\b", low)
+                and re.search(rf"\b{_TXN_WORD}\b", low)):
+            return "list_transactions", {
+                "merchant": extract_merchant(message, self.vocabulary),
+                "period": extract_period(message),
+                "direction": extract_direction(message), "limit": 1,
+                "order": "amount_desc"}
+        if re.search(r"\b(lowest|smallest|min(?:imum)?)\b", low) and (
+                re.search(rf"\b{_TXN_WORD}\b", low)
+                or self._last_context(history).get("last_tool") == "list_transactions"):
+            return "list_transactions", {
+                "merchant": extract_merchant(message, self.vocabulary),
+                "period": extract_period(message),
+                "direction": extract_direction(message), "limit": 1,
+                "order": "amount_asc"}
+        if (re.search(r"\b(month|monthly)\b", low)
+                and re.search(r"\b(high|highest|largest|biggest|most|lowest|smallest|least)\b", low)
+                and re.search(r"\b(expense|spend|spending|spent|income|received)\b", low)):
+            return "rank_months", {
+                "direction": extract_direction(message),
+                "period": extract_period(message), "limit": 1,
+                "order": "asc" if re.search(r"\b(lowest|smallest|least)\b", low) else "desc"}
+        return None
 
     def _plan_rules(self, message: str, history: list):
         """Deterministic planner. Keeps the app usable with no API key."""
@@ -445,6 +517,7 @@ class FinanceAgent:
         direction = extract_direction(text)
         period = extract_period(text)
         merchant = extract_merchant(text, self.vocabulary)
+        prev = self._last_context(history)
 
         # Checked before the generic "show me …" branch, which would otherwise
         # swallow "show me all my accounts" as a transaction listing.
@@ -454,7 +527,6 @@ class FinanceAgent:
 
         if re.search(r"\b(compare|versus|vs\.?|difference between)\b", low) or \
            re.search(r"\bhow (?:does|did) (?:that|this|it) compare\b", low):
-            prev = self._last_context(history)
             # period_a is left unset on purpose: the baseline is derived as the
             # equal-length window immediately before period_b. Hardcoding it
             # (it used to be "two_months_ago") compared a 3-month subject
@@ -465,12 +537,41 @@ class FinanceAgent:
                 "direction": direction,
             }
 
-        if re.search(r"\b(most|highest|top|largest|biggest|ranked?|who did i)\b", low):
+        month_question = bool(re.search(r"\b(month|monthly)\b", low))
+        high_low = re.search(r"\b(most|high|highest|top|largest|biggest|least|lowest|smallest)\b", low)
+
+        if month_question and high_low and re.search(r"\b(expense|spend|spending|spent|income|received)\b", low):
+            return "rank_months", {
+                "direction": direction,
+                "period": period,
+                "limit": 1 if re.search(r"\b(which|what|highest|lowest|least|most)\b", low) else 12,
+                "order": "asc" if re.search(r"\b(least|lowest|smallest)\b", low) else "desc"}
+
+        if re.search(rf"\b(first|earliest|oldest)\b[\w\s]{{0,20}}\b{_TXN_WORD}\b", low):
+            return "list_transactions", {
+                "merchant": merchant, "period": period, "limit": 1, "order": "oldest"}
+
+        if (re.search(r"\b(highest|largest|biggest|max(?:imum)?)\b", low)
+                and re.search(rf"\b(amount|{_TXN_WORD})\b", low)):
+            return "list_transactions", {
+                "merchant": merchant, "period": period,
+                "direction": direction, "limit": 1, "order": "amount_desc"}
+
+        if (re.search(r"\b(lowest|smallest|min(?:imum)?)\b", low)
+                and (re.search(rf"\b(amount|{_TXN_WORD})\b", low)
+                     or prev.get("last_tool") == "list_transactions")):
+            return "list_transactions", {
+                "merchant": merchant, "period": period,
+                "direction": direction, "limit": 1, "order": "amount_asc"}
+
+        if re.search(r"\b(most|highest|top|largest|biggest|ranked?|who did i|least|lowest|smallest)\b", low):
             kind = None
-            if re.search(r"\b(friend|person|people|someone|who)\b", low):
+            if re.search(r"\b(friend|person|people|someone)\b", low):
                 kind = config.KIND_PERSON
+            order = "asc" if re.search(r"\b(least|lowest|smallest)\b", low) else "desc"
             return "rank_counterparties", {
-                "direction": direction, "period": period, "kind": kind, "limit": 10}
+                "direction": direction, "period": period, "kind": kind,
+                "limit": 10, "order": order}
 
         if re.search(r"\b(friend|friends)\b", low):
             return "rank_counterparties", {
@@ -479,17 +580,19 @@ class FinanceAgent:
 
         # "What was my last transaction?" wants the most recent rows, not a
         # spend total. Without this it lands on get_spend and reports a sum.
-        if re.search(r"\b(last|latest|most recent|recent)\b[\w\s]{0,15}\btransactions?\b", low):
+        if re.search(rf"\b(last|latest|most recent|recent)\b[\w\s]{{0,15}}\b{_TXN_WORD}\b", low):
+            limit_m = re.search(rf"\b(?:last|latest|recent)\s+(\d{{1,3}})\s+{_TXN_WORD}\b", low)
+            limit = int(limit_m.group(1)) if limit_m else 1
             return "list_transactions", {
-                "merchant": merchant, "period": period, "limit": 5}
+                "merchant": merchant, "period": period, "limit": limit,
+                "order": "latest"}
 
-        if re.search(r"\b(list|show me|show all|transactions|breakdown|itemi[sz]e)\b", low):
+        if re.search(rf"\b(list|show me|show all|{_TXN_WORD}|breakdown|itemi[sz]e)\b", low):
             return "list_transactions", {
                 "merchant": merchant, "period": period,
                 "direction": direction, "limit": 50}
 
         if not merchant:
-            prev = self._last_context(history)
             merchant = prev.get("merchant")
         return "get_spend", {"merchant": merchant, "period": period, "direction": direction}
 
@@ -503,7 +606,7 @@ class FinanceAgent:
         """
         for h in reversed(history or []):
             ctx = h.get("context") or {}
-            if ctx.get("merchant") or ctx.get("period"):
+            if ctx.get("merchant") or ctx.get("period") or ctx.get("last_tool"):
                 return ctx
         return {}
 

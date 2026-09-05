@@ -245,7 +245,8 @@ def query_spend(con, entity_id: str, direction: str, time_range=None,
 
 def top_counterparties(con, entity_id: str, direction: str, time_range=None,
                        limit: int = 10, kind: str = None,
-                       include_excluded_kinds: bool = False) -> QueryResult:
+                       include_excluded_kinds: bool = False,
+                       order: str = "desc") -> QueryResult:
     """
     Ranked counterparties. Answers "which vendor have I spent on the most".
 
@@ -256,6 +257,8 @@ def top_counterparties(con, entity_id: str, direction: str, time_range=None,
     t0 = time.perf_counter()
     _require_entity(entity_id)
     _require_direction(direction)
+    if order not in ("asc", "desc"):
+        raise ValueError("order must be 'asc' or 'desc'")
     tr = _coerce_range(time_range)
     txn = config.SCHEMA_CONFIG["transaction"]
 
@@ -296,11 +299,12 @@ def top_counterparties(con, entity_id: str, direction: str, time_range=None,
     row = f.iloc[0] if not f.empty else {}
     group_count = int(_num(row.get("group_count")))
 
+    order_sql = "ASC" if order == "asc" else "DESC"
     rows_sql = f"""
         SELECT merchant_norm, ANY_VALUE(counterparty_kind) AS counterparty_kind,
                ROUND(SUM({amount}), 2) AS total_amount, {sum_n} AS txn_count
         FROM {src} WHERE {clause}
-        GROUP BY merchant_norm ORDER BY total_amount DESC LIMIT {int(limit)}
+        GROUP BY merchant_norm ORDER BY total_amount {order_sql}, merchant_norm LIMIT {int(limit)}
     """
     rows = db.query_df(con, rows_sql, params)
 
@@ -314,6 +318,7 @@ def top_counterparties(con, entity_id: str, direction: str, time_range=None,
         "counterparty_kind": kind,
         "top_name": rows.iloc[0]["merchant_norm"] if not rows.empty else None,
         "top_amount": round(float(rows.iloc[0]["total_amount"]), 2) if not rows.empty else 0.0,
+        "rank_order": order,
     }
 
     notes = []
@@ -344,6 +349,62 @@ def top_counterparties(con, entity_id: str, direction: str, time_range=None,
     )
 
 
+def rank_months(con, entity_id: str, direction: str, time_range=None,
+                limit: int = 12, order: str = "desc") -> QueryResult:
+    """Ranks calendar months by total activity."""
+    t0 = time.perf_counter()
+    _require_entity(entity_id)
+    _require_direction(direction)
+    if order not in ("asc", "desc"):
+        raise ValueError("order must be 'asc' or 'desc'")
+    tr = _coerce_range(time_range)
+
+    where = ["entity_id = ?", "transaction_type = ?"]
+    params = [entity_id, direction]
+    if tr.status == RESOLVED:
+        where.append("txn_month BETWEEN ? AND ?")
+        params.extend([tr.start, tr.end])
+    clause = " AND ".join(where)
+
+    f = db.query_df(con, f"""
+        SELECT ROUND(SUM(total_amount), 2) AS grand_total,
+               SUM(txn_count) AS txn_count,
+               COUNT(DISTINCT txn_month) AS month_count
+        FROM {config.TABLE_ROLLUP_MONTHLY} WHERE {clause}
+    """, params)
+    row = f.iloc[0] if not f.empty else {}
+
+    order_sql = "ASC" if order == "asc" else "DESC"
+    rows_sql = f"""
+        SELECT txn_month AS month, ROUND(SUM(total_amount), 2) AS total_amount,
+               SUM(txn_count) AS txn_count
+        FROM {config.TABLE_ROLLUP_MONTHLY} WHERE {clause}
+        GROUP BY txn_month ORDER BY total_amount {order_sql}, month LIMIT {int(limit)}
+    """
+    rows = db.query_df(con, rows_sql, params)
+    month_count = int(_num(row.get("month_count")))
+    facts = {
+        "grand_total": round(_num(row.get("grand_total")), 2),
+        "txn_count": int(_num(row.get("txn_count"))),
+        "month_count": month_count,
+        "shown": len(rows),
+        "direction": direction,
+        "period": tr.label,
+        "rank_order": order,
+        "top_month": str(rows.iloc[0]["month"])[:10] if not rows.empty else None,
+        "top_amount": round(_num(rows.iloc[0]["total_amount"]), 2) if not rows.empty else 0.0,
+    }
+    return QueryResult(
+        rows=rows, facts=facts, sql=rows_sql.strip(), params=params,
+        source=config.TABLE_ROLLUP_MONTHLY,
+        truncated=month_count > len(rows), total_group_count=month_count,
+        latency_ms=round((time.perf_counter() - t0) * 1000, 2),
+        filters={"entity_id": entity_id, "direction": direction,
+                 "start": tr.start, "end": tr.end, "period": tr.label},
+        notes=[],
+    )
+
+
 # =============================================================
 # DRILL-DOWN
 # =============================================================
@@ -353,13 +414,21 @@ MAX_LIST_ROWS = 200
 
 def list_transactions(con, entity_id: str, direction: str = None, time_range=None,
                       merchant: str = None, kind: str = None,
-                      limit: int = 50) -> QueryResult:
+                      limit: int = 50, order: str = "latest") -> QueryResult:
     """Individual rows. Always reads the fact table; descriptions are redacted."""
     t0 = time.perf_counter()
     _require_entity(entity_id)
     tr = _coerce_range(time_range)
     txn = config.SCHEMA_CONFIG["transaction"]
     limit = max(1, min(int(limit), MAX_LIST_ROWS))
+    order_by = {
+        "latest": f"{txn['date_col']} DESC, {txn['id_col']} DESC",
+        "oldest": f"{txn['date_col']} ASC, {txn['id_col']} ASC",
+        "amount_desc": f"{txn['amount_col']} DESC, {txn['date_col']} DESC",
+        "amount_asc": f"{txn['amount_col']} ASC, {txn['date_col']} DESC",
+    }.get(order)
+    if order_by is None:
+        raise ValueError("order must be latest, oldest, amount_desc, or amount_asc")
 
     where = ["entity_id = ?"]
     params = [entity_id]
@@ -392,7 +461,7 @@ def list_transactions(con, entity_id: str, direction: str = None, time_range=Non
                {txn['amount_col']} AS amount, channel,
                {txn['ref_col']} AS reference_id, {txn['desc_col']} AS description
         FROM {config.TABLE_TXN_FACT} WHERE {clause}
-        ORDER BY {txn['date_col']} DESC LIMIT {limit}
+        ORDER BY {order_by} LIMIT {limit}
     """
     rows = db.query_df(con, rows_sql, params)
     if not rows.empty and "description" in rows.columns:
@@ -405,7 +474,18 @@ def list_transactions(con, entity_id: str, direction: str = None, time_range=Non
         "shown": len(rows),
         "period": tr.label,
         "merchant": merchant,
+        "list_order": order,
     }
+    if not rows.empty:
+        first = rows.iloc[0]
+        facts.update({
+            "top_amount": round(_num(first["amount"]), 2),
+            "row_date": str(first["transaction_date"])[:10],
+            "row_merchant": first["merchant_norm"],
+            "row_direction": first["transaction_type"],
+            "row_channel": first.get("channel"),
+            "row_reference": first.get("reference_id"),
+        })
     notes = []
     if total_rows > len(rows):
         notes.append(f"Showing {len(rows)} of {total_rows} transactions. "
@@ -417,7 +497,7 @@ def list_transactions(con, entity_id: str, direction: str = None, time_range=Non
         total_group_count=total_rows,
         latency_ms=round((time.perf_counter() - t0) * 1000, 2),
         filters={"entity_id": entity_id, "merchant": merchant, "direction": direction,
-                 "start": tr.start, "end": tr.end, "period": tr.label},
+                 "start": tr.start, "end": tr.end, "period": tr.label, "order": order},
         notes=notes,
     )
 

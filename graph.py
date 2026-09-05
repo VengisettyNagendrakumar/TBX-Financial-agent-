@@ -329,7 +329,9 @@ def build_graph(agent):
         if tr.status == UNRESOLVED:
             return _unresolved(tr, tool, args)
 
-        gate = agent._gate_period(state.get("canonical"), period_token, tr, explicit)
+        gate = None
+        if tool != "list_transactions":
+            gate = agent._gate_period(state.get("canonical"), period_token, tr, explicit)
         if gate is not None:
             gate.pending.update({"tool": tool, "direction": state["direction"]})
             return {"status": CLARIFY, "question": gate.question,
@@ -356,12 +358,19 @@ def build_graph(agent):
         if tool == "rank_counterparties":
             r = queries.top_counterparties(agent.con, agent.entity_id, direction, tr,
                                            limit=int(args.get("limit") or 10),
-                                           kind=kind)
+                                           kind=kind,
+                                           order=args.get("order") or "desc")
             k = "rank"
+        elif tool == "rank_months":
+            r = queries.rank_months(agent.con, agent.entity_id, direction, tr,
+                                    limit=int(args.get("limit") or 1),
+                                    order=args.get("order") or "desc")
+            k = "month_rank"
         elif tool == "list_transactions":
             r = queries.list_transactions(agent.con, agent.entity_id, direction, tr,
                                           merchant=canonical, kind=kind,
-                                          limit=int(args.get("limit") or 50))
+                                          limit=int(args.get("limit") or 50),
+                                          order=args.get("order") or "latest")
             k = "list"
         else:
             r = queries.query_spend(agent.con, agent.entity_id, direction, tr,
@@ -384,6 +393,9 @@ def build_graph(agent):
 
         # Everything a follow-up may need to inherit.
         ctx = {"direction": state["direction"]}
+        ctx["last_tool"] = state["tool"]
+        if state["tool"] == "list_transactions":
+            ctx["list_order"] = state["args"].get("order") or "latest"
         if state.get("canonical"):
             ctx["merchant"] = state["canonical"]
         if state.get("period_token"):

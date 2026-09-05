@@ -105,14 +105,19 @@ with st.sidebar:
 
     st.divider()
     st.caption("**Try asking**")
-    for q in ["How much have I spent on Swiggy last month?",
-              "How much have I spent on Zomato total?",
-              "Which vendor have I spent on the most?",
-              "How much did my friend pay me in the last 3 months?",
-              "I want to calculate my spending for swiggy",
-              "How does that compare to the month before?",
-              "What did I spend on Oracle?",
-              "Show my balance"]:
+    for q in [
+        "How much have I spent on Swiggy last month?",
+        "How much have I spent on Zomato total?",
+        "Which vendor have I spent on the most?",
+        "What are transactions made to amazon?",
+        "Show my largest transaction on Swiggy last month",
+        "How much did my friend pay me in the last 3 months?",
+        "I want to calculate my spending for swiggy",
+        "How does that compare to the month before?",
+        "How much did I spend on selection?",
+        "What did I spend on Oracle?",
+        "Show my balance",
+    ]:
         if st.button(q, key=f"s_{q}", use_container_width=True):
             st.session_state.queued = q
 
@@ -271,7 +276,7 @@ if prompt:
 
     history = [{"role": m["role"], "content": m.get("content", ""),
                 "context": m.get("context", {})}
-               for m in st.session_state.messages]
+               for m in st.session_state.messages[:-1]]
 
     with st.chat_message("assistant"):
         with st.spinner("Querying…"):

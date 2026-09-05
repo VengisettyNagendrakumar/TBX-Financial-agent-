@@ -444,6 +444,31 @@ def test_query_layer(con):
               __import__("re").search(rf"\d{{{config.PII_MIN_DIGIT_RUN},}}", str(d))
               for d in lst.rows["description"]))
 
+    latest = queries.list_transactions(con, ent, None, limit=1, order="latest")
+    oldest = queries.list_transactions(con, ent, None,
+                                       db.resolve_time_range("ytd", anchor),
+                                       limit=1, order="oldest")
+    biggest = queries.list_transactions(con, ent, config.TXN_DEBIT,
+                                        limit=1, order="amount_desc")
+    least = queries.top_counterparties(con, ent, config.TXN_DEBIT,
+                                       limit=1, order="asc")
+    high_month = queries.rank_months(con, ent, config.TXN_DEBIT,
+                                     limit=1, order="desc")
+    check("latest transaction returns exactly one row",
+          len(latest.rows) == 1 and latest.facts["shown"] == 1, f"{latest.facts}")
+    check("oldest transaction uses ascending date order",
+          len(oldest.rows) == 1 and oldest.facts["list_order"] == "oldest",
+          f"{oldest.facts}")
+    check("highest transaction is a single debit row, not a vendor total",
+          len(biggest.rows) == 1 and "amount" in biggest.rows.columns,
+          f"{biggest.rows}")
+    check("least contributor ranking uses ascending order",
+          least.facts["rank_order"] == "asc" and len(least.rows) == 1,
+          f"{least.facts}")
+    check("highest expense month is ranked by month, not merchant",
+          high_month.facts["top_month"] is not None and "month" in high_month.rows.columns,
+          f"{high_month.facts}")
+
 
 # =============================================================
 # 8. Resolver  (Phase 3)
@@ -461,7 +486,7 @@ def test_resolver(con):
         return resolver.resolve_merchant(con, ent, name, vocabulary=vocab)
 
     for probe, expected in [("swiggy", "SWIGGY"), ("SWIGGY", "SWIGGY"),
-                            ("zomato", "ZOMATO"), ("amazon", "AMAZON")]:
+                            ("zomato", "ZOMATO"), ("flipkart", "FLIPKART")]:
         r = rs(probe)
         check(f"'{probe}' -> {expected}", r.status == resolver.MATCH and r.entity == expected,
               f"got {r.status} {r.entity}")
@@ -478,7 +503,8 @@ def test_resolver(con):
 
     # Brand <-> legal entity. Without this, Swiggy spend splits in two.
     for probe, expected in [("BUNDL TECHNOLOGIES", "SWIGGY"), ("ETERNAL", "ZOMATO"),
-                            ("Amazon Seller Services", "AMAZON")]:
+                            ("AWS", "AMAZON WEB SERVICES"),
+                            ("Amazon Seller Services", "AMAZON LOGISTICS")]:
         r = rs(probe)
         check(f"alias '{probe}' -> {expected}",
               r.status == resolver.MATCH and r.entity == expected,
@@ -499,6 +525,11 @@ def test_resolver(con):
     check("'selection' is AMBIGUOUS with candidates",
           r.status == resolver.AMBIGUOUS and len(r.candidates) > 1,
           f"got {r.status} {r.candidates}")
+
+    r_amz = rs("amazon")
+    check("'amazon' is AMBIGUOUS with candidates",
+          r_amz.status == resolver.AMBIGUOUS and len(r_amz.candidates) > 1,
+          f"got {r_amz.status} {r_amz.candidates}")
 
     # IFSC codes must not be resolvable as counterparties.
     codes = [c[0] for c in con.execute("SELECT bank_code FROM raw_bank").fetchall()]
@@ -553,6 +584,11 @@ def test_agent(con):
     for text, tool in [("How much have I spent on Swiggy last month?", "get_spend"),
                        ("How much have I spent on Zomato total?", "get_spend"),
                        ("Which vendor have I spent on the most?", "rank_counterparties"),
+                       ("Who is the least contributor for my spendings?", "rank_counterparties"),
+                       ("On which month I have high expense?", "rank_months"),
+                       ("What was my latest transaction?", "list_transactions"),
+                       ("First transaction for this year", "list_transactions"),
+                       ("What was the highest amount transaction I have done?", "list_transactions"),
                        ("How much did my friend pay me in the last 3 months?",
                         "rank_counterparties"),
                        ("Show my balance", "get_balances")]:
@@ -659,6 +695,54 @@ def test_agent(con):
     check("'my last transaction' covers both directions",
           r_last.result is not None and r_last.result.filters.get("direction") is None,
           f"{r_last.result.filters if r_last.result else None}")
+
+    check("'latest transaction' returns one latest row",
+          r_last.result is not None and len(r_last.result.rows) == 1
+          and r_last.result.filters.get("order") == "latest",
+          f"{r_last.result.filters if r_last.result else None}")
+
+    r_first = bot.run("what was my first transaction for this year")
+    check("'first transaction this year' uses oldest row over YTD",
+          r_first.kind == "list" and r_first.result.filters.get("order") == "oldest"
+          and r_first.result.filters.get("period") == "2026 year to date",
+          f"{r_first.status}: {r_first.result.filters if r_first.result else None}")
+
+    r_hi = bot.run("what was the highest amount I have done in transaction")
+    check("'highest amount transaction' returns a single transaction row",
+          r_hi.kind == "list" and len(r_hi.result.rows) == 1
+          and r_hi.result.filters.get("order") == "amount_desc",
+          f"{r_hi.status}: {r_hi.result.filters if r_hi.result else None}")
+
+    hist_hi = [{"role": "assistant", "content": "...",
+                "context": {"last_tool": "list_transactions",
+                            "list_order": "amount_desc",
+                            "direction": config.TXN_DEBIT}}]
+    r_lo = bot.run("which is the lowest", history=hist_hi)
+    check("relative lowest after highest transaction stays a transaction query",
+          r_lo.kind == "list" and r_lo.result.filters.get("order") == "amount_asc",
+          f"{r_lo.status}: {r_lo.result.filters if r_lo.result else None}")
+
+    r_month = bot.run("on which month I have high expense")
+    check("highest expense month does not resolve the wording as a merchant",
+          r_month.kind == "month_rank" and r_month.status == A.ANSWER,
+          f"{r_month.status}: {r_month.answer}")
+
+    r_least = bot.run("Who is the least contributor for my spendings?")
+    check("least contributor is answered by ascending ranking",
+          r_least.kind == "rank" and r_least.result.facts.get("rank_order") == "asc"
+          and r_least.result.facts.get("counterparty_kind") is None
+          and not r_least.result.rows.empty,
+          f"{r_least.status}: {r_least.answer}")
+
+    r_which = bot.run("on which one I have done my last transaction")
+    check("'on which one' is not treated as a merchant name",
+          r_which.kind == "list" and not r_which.result.filters.get("merchant"),
+          f"{r_which.status}: {r_which.answer}")
+
+    book = bot.run("last 5 transaction in bookmyshow")
+    check("last 5 merchant transactions do not ask for a period",
+          book.status != A.CLARIFY and book.kind == "list",
+          f"{book.status}: {book.question or book.answer}")
 
     # An explicitly named counterparty must win over the inherited one.
     args3 = {}
